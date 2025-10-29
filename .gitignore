@@ -1,3 +1,7 @@
+train_session/
+uploads/
+outputs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

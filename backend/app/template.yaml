@@ -1,0 +1,20 @@
+root: outputs/predictions
+# --- D A T A S E T --- #
+
+test_dataset_list:
+  - dataset: npz
+    dataset_input: PLACEHOLDER
+    key_mapping:
+      pos: pos
+      pos__mask__: pos__mask__
+      atom_types: node_types
+      atom_types__mask__: node_types__mask__
+      atom_rows: atom_rows
+      atom_rows__mask__: atom_rows__mask__
+      atom_cols: atom_cols
+      atom_cols__mask__: atom_cols__mask__
+      _mean_.per_type.cs_iso: _mean_.per_type.cs_iso
+      _std_.per_type.cs_iso: _std_.per_type.cs_iso
+      _mean_.per_type.cs_tensor_spherical: _mean_.per_type.cs_tensor_spherical
+      _std_.per_type.cs_tensor_spherical: _std_.per_type.cs_tensor_spherical
+      Lattice: cell
