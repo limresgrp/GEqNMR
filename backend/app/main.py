@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+import zipfile
 import shutil
 from pathlib import Path
 import traceback
@@ -52,7 +53,7 @@ def read_root():
 
 
 # --- UTILITY: Simplified Inference Workflow ---
-async def run_inference_workflow(input_path: Path, output_dir: Path, destandardize: bool):
+async def run_inference_workflow(input_path: Path, output_dir: Path, destandardize: bool, trajectory_path: Path = None):
     """
     Orchestrates loading, inference, and file saving for an uploaded structure file.
     It saves PDB/GRO input as PDB (with B-factors) and XYZ input as Extended XYZ.
@@ -65,7 +66,7 @@ async def run_inference_workflow(input_path: Path, output_dir: Path, destandardi
     
     # 1. Load Model and its original training config
     try:
-        model, train_config = CheckpointHandler.load_model_from_training_session(
+        model, config = CheckpointHandler.load_model_from_training_session(
             traindir=MODEL_DIR, model_name=MODEL_CHECKPOINT, device=device.type
         )
         print(f"Model {MODEL_CHECKPOINT} loaded successfully from {MODEL_DIR}")
@@ -80,19 +81,17 @@ async def run_inference_workflow(input_path: Path, output_dir: Path, destandardi
              raise FileNotFoundError(f"Template config not found at {TEMPLATE_CONFIG}")
              
         test_config = Config.from_file(TEMPLATE_CONFIG)
-        config = train_config
         config.update(test_config)
         # Set batch size for inference
         config['batch_size'] = config.get('batch_size', 1) 
         print("Configuration loaded and merged.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load or merge configuration: {e}")
-
     # 3. Process the uploaded PDB/GRO/XYZ file to NPZ format (temporarily on disk)
     npz_output_path = OUTPUT_DIR / f"temp_{input_path.stem}.npz"
     try:
         # This will create a temporary NPZ file containing atom coordinates and types
-        npz_output_path, num_molecules = processing.process_uploaded_file(input_path, OUTPUT_DIR)
+        npz_output_path, num_molecules = processing.process_uploaded_file(input_path, OUTPUT_DIR, trajectory_path)
         print(f"Structure processed into temporary NPZ: {npz_output_path}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to process structure file into NPZ format for inference: {e}")
@@ -150,10 +149,6 @@ async def run_inference_workflow(input_path: Path, output_dir: Path, destandardi
         with torch.no_grad():
             for data in dataloader:
                 data = data.to(device)
-                for k,v in data:
-                    try:
-                        print(k, v.shape, v[:5])
-                    except: pass
                 # Run inference without loss/metrics logic
                 out, _, _, _ = geq_run_inference(
                     model=model, data=data, device=device,
@@ -192,81 +187,54 @@ async def run_inference_workflow(input_path: Path, output_dir: Path, destandardi
         # Concatenate all batches
         final_predictions = np.concatenate(all_predictions, axis=0)
         
-        # 6. Save Predictions to Output File (PDB or extended XYZ)
+        # 6. Save Predictions to Output File(s)
         file_extension = input_path.suffix.lower()
         if file_extension in [".pdb", ".gro"]:
-            output_path = processing.save_predictions_to_pdb(
-                input_pdb_path=input_path,
+            output_paths, is_trajectory = processing.save_predictions_to_pdb(
+                input_path=input_path,
                 predictions_np=final_predictions,
                 output_dir=output_dir
             )
+
+            # If it's a PDB trajectory, zip the individual frame files
+            if is_trajectory:
+                zip_filename = f"{input_path.stem}_inferred_frames.zip"
+                zip_path = output_dir / zip_filename
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    for file_path in output_paths:
+                        zipf.write(file_path, arcname=file_path.name)
+                        file_path.unlink() # Clean up individual PDBs
+                
+                final_output_path = zip_path
+            else:
+                final_output_path = output_paths[0]
         elif file_extension == ".xyz":
-            # Call the new function for XYZ output
-            output_path = processing.save_predictions_to_xyz(
+            # For XYZ, save_predictions_to_xyz handles both single and multi-frame cases, returning one file.
+            final_output_path = processing.save_predictions_to_xyz(
                 input_xyz_path=input_path,
                 predictions_np=final_predictions,
                 output_dir=output_dir
             )
         else:
-            raise ValueError(f"Unsupported input file type for saving: {file_extension}")
-        
+            raise ValueError(f"Unsupported file type for saving predictions: {file_extension}")
+
         # 7. Cleanup temporary NPZ file
         npz_output_path.unlink(missing_ok=True)
         
         print("--- Inference Workflow Complete ---")
-        return output_path, final_predictions.shape[0]
+        return final_output_path, final_predictions.shape[0]
         
     except Exception as e:
         print(f"Error during inference execution: {e}")
         traceback.print_exc()
         npz_output_path.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Error during model inference or PDB saving: {e}")
-
-
-@app.post("/process/")
-async def process_file(file: UploadFile = File(...)):
-    """
-    Endpoint to upload a file, process it, and save the .npz output. (Existing logic)
-    """
-    # Securely save the uploaded file
-    input_path = UPLOAD_DIR / file.filename
-    try:
-        with input_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-    except Exception as e:
-        print(f"Error saving file: {e}")
-        raise HTTPException(status_code=500, detail=f"Could not save uploaded file: {e}")
-    finally:
-        file.file.close()
-
-    print(f"File saved to: {input_path}")
-
-    # --- Run the processing script ---
-    try:
-        print(f"Starting processing for: {input_path.name}")
-        output_path, num_molecules = processing.process_uploaded_file(input_path, OUTPUT_DIR)
-        
-        print(f"Processing complete. Output at: {output_path}")
-        return {
-            "message": "File processed successfully!",
-            "input_file": file.filename,
-            "output_file": str(output_path),
-            "molecules_processed": num_molecules
-        }
-        
-    except ValueError as ve:
-        print(f"Validation Error: {ve}")
-        traceback.print_exc()
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        print(f"Internal Server Error during processing: {e}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"An internal error occurred during processing: {e}")
+        raise HTTPException(status_code=500, detail=f"Error during model inference or file saving: {e}")
 
 
 @app.post("/infer/pdb/")
 async def infer_pdb_file(
     file: UploadFile = File(...),
+    trajectory_file: UploadFile = File(None),
     destandardize: bool = Form(True) # Default to True if not provided
 ):
     """
@@ -287,14 +255,28 @@ async def infer_pdb_file(
     finally:
         file.file.close()
 
+    trajectory_input_path = None
+    if trajectory_file:
+        trajectory_input_path = UPLOAD_DIR / trajectory_file.filename
+        try:
+            with trajectory_input_path.open("wb") as buffer:
+                shutil.copyfileobj(trajectory_file.file, buffer)
+        except Exception as e:
+            print(f"Error saving trajectory file: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not save uploaded trajectory file: {e}")
+        finally:
+            trajectory_file.file.close()
+        print(f"Trajectory file saved to: {trajectory_input_path}")
+
     print(f"File saved to: {input_path}")
     
     # 2. Run Inference Workflow
     try:
         output_path, num_atoms_predicted = await run_inference_workflow(
             input_path=input_path, 
-            output_dir=OUTPUT_DIR, 
-            destandardize=destandardize
+            output_dir=OUTPUT_DIR,
+            destandardize=destandardize,
+            trajectory_path=trajectory_input_path
         )
         
         return {
@@ -329,6 +311,8 @@ def download_file(filename: str):
         media_type = "chemical/x-pdb"
     elif file_path.suffix.lower() == ".npz":
         media_type = "application/zip" # NPZ is often treated as a zip file type
+    elif file_path.suffix.lower() == ".zip":
+        media_type = "application/zip"
     elif file_path.suffix.lower() == ".xyz":
         media_type = "chemical/x-xyz"
     

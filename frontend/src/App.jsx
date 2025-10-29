@@ -10,7 +10,7 @@ function App() {
   const [uploadMessage, setUploadMessage] = useState('');
   const [uploadMessageColor, setUploadMessageColor] = useState('');
   const [isUploading, setIsUploading] = useState(false);
-  const [mode, setMode] = useState('infer'); // Default to 'infer' as requested by the user's task
+  const [trajectoryFile, setTrajectoryFile] = useState(null);
   const [outputFilePath, setOutputFilePath] = useState(null);
   const [destandardize, setDestandardize] = useState(true); // New state for de-standardization toggle
 
@@ -36,6 +36,7 @@ function App() {
   const handleFileChange = (event) => {
     setSelectedFile(event.target.files[0]);
     setUploadMessage(''); 
+    setTrajectoryFile(null); // Reset trajectory if main file changes
     setOutputFilePath(null); // Clear previous output
   };
 
@@ -57,23 +58,19 @@ function App() {
     const formData = new FormData();
     formData.append('file', selectedFile);
 
-    // Determine the target endpoint based on the selected mode
-    let targetUrl;
-    let allowedMimeTypes;
-
-    if (mode === 'process') {
-      targetUrl = `${API_URL}/process/`;
-      allowedMimeTypes = ['.xyz', '.pdb', '.gro']; 
-    } else { // mode === 'infer'
-      formData.append('destandardize', destandardize); // Add the flag to the form data
-      targetUrl = `${API_URL}/infer/pdb/`;
-      allowedMimeTypes = ['.xyz', '.pdb', '.gro'];
+    if (trajectoryFile) {
+      formData.append('trajectory_file', trajectoryFile);
     }
+
+    formData.append('destandardize', destandardize); // Add the flag to the form data
+    
+    const targetUrl = `${API_URL}/infer/pdb/`;
+    const allowedMimeTypes = ['.xyz', '.pdb', '.gro'];
 
     // Basic file type check before sending
     const fileExtension = selectedFile.name.split('.').pop().toLowerCase();
-    if (!allowedMimeTypes.includes('.' + fileExtension)) {
-        setUploadMessage(`Error: File type .${fileExtension} is not supported in ${mode} mode.`);
+    if (!allowedMimeTypes.includes('.' + fileExtension)) { 
+        setUploadMessage(`Error: File type .${fileExtension} is not supported.`);
         setUploadMessageColor('text-red-500');
         setIsUploading(false);
         return;
@@ -95,7 +92,7 @@ function App() {
     })
     .then(({ ok, data }) => {
       if (ok) {
-        setUploadMessage(`Success! ${data.atoms_predicted ? `${data.atoms_predicted} atoms predicted.` : `${data.molecules_processed} molecules processed to NPZ.`}`);
+        setUploadMessage(`Success! ${data.atoms_predicted} atom predictions generated.`);
         setUploadMessageColor('text-green-500');
         
         // Extract the filename from the full path returned by FastAPI
@@ -116,24 +113,21 @@ function App() {
       setIsUploading(false);
       // Reset the file input visually
       if (document.getElementById('file-upload')) {
-        document.getElementById('file-upload').value = '';
+          document.getElementById('file-upload').value = '';
+      }
+      if (document.getElementById('trajectory-upload')) {
+          document.getElementById('trajectory-upload').value = '';
       }
     });
   };
   
-  const handleModeChange = (newMode) => {
-    setMode(newMode);
-    setSelectedFile(null);
-    setUploadMessage('');
-    setOutputFilePath(null);
+  const handleTrajectoryFileChange = (event) => {
+    setTrajectoryFile(event.target.files[0]);
   };
-  
   const downloadLink = outputFilePath ? `${API_URL}/download/${outputFilePath}` : '#';
-  const buttonText = isUploading ? 'Working...' : (mode === 'infer' ? 'Run Inference & Get PDB' : 'Process to NPZ');
-  const allowedFileTypes = mode === 'infer' ? '.pdb, .gro, .xyz' : '.xyz, .pdb, .gro';
-  const instructions = mode === 'infer' 
-    ? "Upload a .pdb, .gro, or .xyz file. Predictions will be saved to the B-factor column in a new PDB."
-    : "Upload a structure file (.xyz, .pdb, or .gro) to generate a preparatory .npz file.";
+  const buttonText = isUploading ? 'Working...' : 'Run Inference';
+  const allowedFileTypes = '.pdb, .gro, .xyz';
+  const instructions = "Upload a PDB, GRO, or XYZ file. For PDB/GRO, predictions are in the B-factor column. For XYZ, they are in a new 'cs_iso' column. Trajectories are returned as a ZIP of PDBs or a multi-frame XYZ file.";
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 flex flex-col items-center p-8 font-sans">
@@ -156,37 +150,10 @@ function App() {
           </div>
         </div>
 
-        {/* 2. Mode Selection */}
-        <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
-            <h2 className="text-2xl font-semibold mb-4 text-gray-200">Select Workflow Mode</h2>
-            <div className="flex justify-center space-x-4">
-                <button
-                    onClick={() => handleModeChange('process')}
-                    className={`px-6 py-3 rounded-lg font-bold transition-colors duration-200 ${
-                        mode === 'process' 
-                            ? 'bg-indigo-600 text-white shadow-lg' 
-                            : 'bg-gray-700 text-gray-300 hover:bg-indigo-500/30'
-                    }`}
-                >
-                    NPZ Generation (Data Processing)
-                </button>
-                <button
-                    onClick={() => handleModeChange('infer')}
-                    className={`px-6 py-3 rounded-lg font-bold transition-colors duration-200 ${
-                        mode === 'infer' 
-                            ? 'bg-green-600 text-white shadow-lg' 
-                            : 'bg-gray-700 text-gray-300 hover:bg-green-500/30'
-                    }`}
-                >
-                    PDB Inference (Prediction)
-                </button>
-            </div>
-        </div>
-
-        {/* 3. File Upload Card */}
+        {/* 2. File Upload Card */}
         <div className="bg-gray-800 p-6 rounded-lg shadow-lg">
           <h2 className="text-2xl font-semibold mb-4 text-gray-200">
-            {mode === 'infer' ? 'Run NMR Prediction' : 'Generate NPZ Dataset'}
+            Run NMR Prediction
           </h2>
           <p className="text-gray-400 mb-4">{instructions}</p>
           
@@ -196,7 +163,6 @@ function App() {
               <label htmlFor="file-upload" className="sr-only">Choose file</label>
               <input
                 id="file-upload"
-                key={mode} 
                 type="file"
                 onChange={handleFileChange}
                 accept={allowedFileTypes}
@@ -211,8 +177,27 @@ function App() {
               />
             </div>
 
+            {/* Trajectory File Input (Optional) */}
+            {selectedFile && (
+              <div>
+                <label htmlFor="trajectory-upload" className="block text-sm font-medium text-gray-400 mb-1">
+                  Trajectory File (Optional)
+                </label>
+                <input
+                  id="trajectory-upload"
+                  type="file"
+                  onChange={handleTrajectoryFileChange}
+                  className="block w-full text-sm text-gray-400
+                    file:mr-4 file:py-2 file:px-4
+                    file:rounded-md file:border-0
+                    file:text-sm file:font-semibold
+                    file:bg-gray-600 file:text-white
+                    hover:file:bg-gray-700 disabled:opacity-50"
+                  disabled={isUploading} />
+              </div>
+            )}
             {/* NEW: De-standardization Toggle for Inference Mode */}
-            {mode === 'infer' && (
+            {(
               <div className="flex items-center justify-center pt-2">
                 <input
                   id="destandardize-checkbox"
@@ -262,7 +247,7 @@ function App() {
                       Download Output: {outputFilePath}
                   </a>
                   <p className="text-sm text-gray-500 mt-2">
-                      ({outputFilePath.endsWith('.pdb') ? 'Predictions are in the B-factor column.' : 'NPZ file generated.'})
+                      ({outputFilePath.endsWith('.zip') ? 'ZIP archive of PDB frames.' : (outputFilePath.endsWith('.xyz') ? "Extended XYZ file with 'cs_iso' column." : 'Predictions are in the B-factor column.')})
                   </p>
               </div>
           )}

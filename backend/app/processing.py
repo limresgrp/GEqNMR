@@ -57,14 +57,15 @@ def load_config_from_yaml(config_path: Path):
 
 # --- FUNCTION: Save Predictions to PDB (Used for PDB/GRO input) ---
 
-def save_predictions_to_pdb(input_pdb_path: Path, predictions_np: np.ndarray, output_dir: Path):
+def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output_dir: Path):
     """
-    Loads a structure (PDB/GRO), updates the Beta-factor column with predictions (cs_iso),
-    and saves a new PDB file.
+    Loads a structure, updates the B-factor column with predictions, and saves new PDB file(s).
+    If the input is a trajectory (multi-frame), it saves one PDB per frame.
+    Returns a list of output paths and a boolean indicating if it was a trajectory.
     """
-    print(f"--- Writing predictions to {input_pdb_path.name} as PDB/GRO ---")
+    print(f"--- Writing predictions from {input_path.name} to PDB format ---")
     
-    universe = mda.Universe(str(input_pdb_path))
+    universe = mda.Universe(str(input_path))
     atoms = universe.atoms
     
     # Calculate the total number of atoms in the entire trajectory
@@ -84,27 +85,36 @@ def save_predictions_to_pdb(input_pdb_path: Path, predictions_np: np.ndarray, ou
     b_factors = predictions_np.reshape(-1).astype(np.float32)
     b_factors_clipped = np.clip(b_factors, -999.99, 999.99)
     
-    output_filename = f"{input_pdb_path.stem}_inferred.pdb"
-    output_path = output_dir / output_filename
-    
-    # Assign predictions back to the trajectory, frame by frame
-    atom_cursor = 0
-    # n_atoms is the number of atoms per frame
-    n_atoms = n_atoms_per_frame 
-    
-    for ts in universe.trajectory:
-        # FIX: Use slice assignment ([:]) to modify the underlying array property in-place.
-        universe.atoms.tempfactors[:] = b_factors_clipped[atom_cursor : atom_cursor + n_atoms]
-        atom_cursor += n_atoms
+    is_trajectory = total_frames > 1
+    output_paths = []
 
-    # Write the entire modified trajectory/structure.
-    atoms.write(str(output_path))
-    
-    print(f"Predictions saved as B-factors to: {output_path}")
-    
-    return output_path
+    if is_trajectory:
+        print(f"Detected trajectory with {total_frames} frames. Saving each frame as a separate PDB.")
+        atom_cursor = 0
+        for i, ts in enumerate(universe.trajectory):
+            frame_predictions = b_factors_clipped[atom_cursor : atom_cursor + n_atoms_per_frame]
+            universe.atoms.tempfactors = frame_predictions
+            
+            output_filename = f"{input_path.stem}_inferred_frame_{i+1}.pdb"
+            frame_output_path = output_dir / output_filename
+            
+            # Select only the current frame for writing
+            universe.trajectory[i]
+            atoms.write(str(frame_output_path))
+            output_paths.append(frame_output_path)
+            atom_cursor += n_atoms_per_frame
+        print(f"Saved {len(output_paths)} PDB files.")
+    else:
+        # Single frame file
+        output_filename = f"{input_path.stem}_inferred.pdb"
+        output_path = output_dir / output_filename
+        universe.atoms.tempfactors = b_factors_clipped
+        atoms.write(str(output_path))
+        output_paths.append(output_path)
+        print(f"Predictions saved as B-factors to: {output_path}")
 
-# --- NEW FUNCTION: Save Predictions to Extended XYZ (Used for XYZ input) ---
+    return output_paths, is_trajectory
+
 
 def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, output_dir: Path):
     """
@@ -194,15 +204,21 @@ def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, ou
     return output_path
 
 # --- Existing Function: MDAnalysis Parser (for PDB/GRO) ---
-
-def parse_structure_file_mdanalysis(filepath: Path):
+def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None):
     """
     Parses PDB or GRO files using MDAnalysis for inference.
     Only extracts positions and atom types (atomic numbers).
+    If a trajectory_path is provided, it's loaded with the structure.
     """
     print(f"--- Parsing {filepath.name} with MDAnalysis (Inference Mode) ---")
+    if trajectory_path:
+        print(f"--- Loading trajectory from {trajectory_path.name} ---")
+    
     try:
-        universe = mda.Universe(str(filepath))
+        if trajectory_path:
+            universe = mda.Universe(str(filepath), str(trajectory_path))
+        else:
+            universe = mda.Universe(str(filepath))
     except Exception as e:
         print(f"Error: MDAnalysis failed to read {filepath}. Reason: {e}")
         return []
@@ -797,7 +813,7 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
 
 # --- Main Wrapper Function ---
 
-def process_uploaded_file(input_path: Path, output_dir: Path):
+def process_uploaded_file(input_path: Path, output_dir: Path, trajectory_path: Path = None):
     """
     Main function to process an uploaded file, route to the correct parser,
     and save the output.
@@ -809,12 +825,12 @@ def process_uploaded_file(input_path: Path, output_dir: Path):
     
     all_molecules_data = []
     statistics = {}
-    
-    if file_extension == ".xyz":
+
+    if file_extension in [".pdb", ".gro", ".xyz"]:
         # Full processing for XYZ files (with ground truth)
-        all_molecules_data = parse_extxyz_file(input_path, convert_cartesian_to_spherical)
+        all_molecules_data = parse_structure_file_mdanalysis(input_path, trajectory_path)
         if not all_molecules_data:
-            raise ValueError("Failed to parse any molecules from XYZ file.")
+            raise ValueError(f"Failed to parse any molecules from {file_extension.upper()} file.")
         
         # Only compute stats if cs_tensor was present
         if any("cs_tensor_spherical" in mol for mol in all_molecules_data):
@@ -822,13 +838,6 @@ def process_uploaded_file(input_path: Path, output_dir: Path):
             standardize_data(all_molecules_data, statistics, STANDARDIZATION_CONFIG)
         else:
             print("No 'cs_tensor' found in XYZ, skipping statistics and standardization.")
-
-    elif file_extension in [".pdb", ".gro"]:
-        # Inference-only processing for PDB/GRO files (Generates NPZ for inference workflow)
-        all_molecules_data = parse_structure_file_mdanalysis(input_path)
-        if not all_molecules_data:
-             raise ValueError("Failed to parse any molecules from PDB/GRO file.")
-        # Statistics and standardization are skipped as requested
 
     else:
         raise ValueError(f"Unsupported file type: {file_extension}. Please upload .xyz, .pdb, or .gro")
