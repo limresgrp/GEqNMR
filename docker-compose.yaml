@@ -1,0 +1,41 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: .devcontainer/Dockerfile
+    # We use 'sh -c' to run a sequence of commands.
+    # 1. Install/update Python packages from requirements.txt.
+    # 2. If successful (&&), then start the Uvicorn server.
+    # The app path is now relative to the new working_dir.
+    command: >
+      sh -c "uvicorn backend.app.main:app --reload --workers 1 --host 0.0.0.0 --port 8000"
+    volumes:
+      - .:/workspaces/GEqNMR
+    ports:
+      - "127.0.0.1:8000:8000"
+    # Set the working directory to the project root.
+    # This makes Python imports consistent.
+    working_dir: /workspaces/GEqNMR
+    depends_on:
+      - redis
+    tty: true
+
+  frontend:
+    image: node:20-alpine
+    # MODIFICATION:
+    # Same principle as the backend.
+    # 1. Install/update Node.js packages from package.json.
+    # 2. If successful (&&), then start the Vite dev server.
+    command: >
+      sh -c "npm install &&
+             npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "127.0.0.1:5173:5173"
+    working_dir: /app
+    tty: true
+
+  redis:
+    image: redis:alpine
+    # No port mapping needed for redis, it's only used internally
