@@ -252,6 +252,47 @@ def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, ou
     print(f"Predictions saved as 'cs_iso' property to: {output_path}")
     return output_path
 
+# --- Utility: Parse XYZ lattice matrices from header ---
+def parse_xyz_lattice_matrices(filepath: Path):
+    """
+    Parses the Lattice field from each frame header in an extended XYZ file.
+    Returns a list of flattened 3x3 matrices (or None if not present).
+    """
+    try:
+        lines = filepath.read_text().splitlines()
+    except OSError as e:
+        print(f"Warning: Failed to read XYZ file for lattice parsing: {e}")
+        return []
+
+    matrices = []
+    line_idx = 0
+    while line_idx < len(lines):
+        if not lines[line_idx].strip():
+            line_idx += 1
+            continue
+        try:
+            num_atoms = int(lines[line_idx].strip())
+        except ValueError:
+            line_idx += 1
+            continue
+        header = lines[line_idx + 1].strip() if line_idx + 1 < len(lines) else ""
+        lattice_matrix = None
+        header_parts = shlex.split(header)
+        for part in header_parts:
+            if part.startswith("Lattice="):
+                _key, value = part.split("=", 1)
+                try:
+                    lattice_vals = np.fromstring(value.replace('"', ''), sep=' ', dtype=np.float32)
+                except ValueError:
+                    lattice_vals = np.array([])
+                if lattice_vals.size == 9 and not np.allclose(lattice_vals, 0.0):
+                    lattice_matrix = lattice_vals.reshape(-1)
+                break
+        matrices.append(lattice_matrix)
+        line_idx += num_atoms + 2
+
+    return matrices
+
 # --- Existing Function: MDAnalysis Parser (for PDB/GRO) ---
 def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None):
     """
@@ -273,8 +314,11 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
         return []
 
     molecules_data = []
+    xyz_lattices = []
+    if filepath.suffix.lower() == ".xyz":
+        xyz_lattices = parse_xyz_lattice_matrices(filepath)
     # Process each frame (timestep) in the file
-    for ts in universe.trajectory:
+    for ts_idx, ts in enumerate(universe.trajectory):
         try:
             atoms = universe.atoms
             num_atoms = len(atoms)
@@ -286,10 +330,27 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
             # Get positions
             mol_dict['pos'] = atoms.positions.astype(np.float32)
 
+            lattice_from_header = None
+            if xyz_lattices and ts_idx < len(xyz_lattices):
+                lattice_from_header = xyz_lattices[ts_idx]
+
+            pbc_present = lattice_from_header is not None
+            pbc_detected = False
             if ts.dimensions is not None and not np.allclose(ts.dimensions, 0.0):
                 box_matrix = mdamath.triclinic_vectors(ts.dimensions, dtype=np.float32)
                 if np.any(box_matrix):
-                    mol_dict['Lattice'] = box_matrix.reshape(-1)
+                    pbc_detected = True
+                    if not pbc_present:
+                        mol_dict['Lattice'] = box_matrix.reshape(-1)
+
+            if filepath.suffix.lower() != ".xyz":
+                pbc_present = pbc_detected
+
+            if pbc_present and lattice_from_header is not None:
+                mol_dict['Lattice'] = lattice_from_header
+
+            mol_dict['pbc_present'] = np.array(pbc_present, dtype=bool)
+            mol_dict['pbc_detected'] = np.array(pbc_detected, dtype=bool)
 
             # Get atom types (Atomic Numbers)
             atom_types = np.zeros(num_atoms, dtype=np.int64)
@@ -341,9 +402,6 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
             mol_dict['atom_types'] = atom_types
             mol_dict['atom_rows'] = atom_rows
             mol_dict['atom_cols'] = atom_cols
-
-            # Add center_atoms_mask (assume all atoms are relevant for inference)
-            mol_dict['center_atoms_mask'] = np.ones(num_atoms, dtype=bool)
             
             molecules_data.append(mol_dict)
 
@@ -516,14 +574,11 @@ def parse_extxyz_file(filepath: Path, cartesian_to_spherical_converter_func):
 
                 if 'pos' in raw_atom_data: mol_dict['pos'] = raw_atom_data['pos']
                 if 'forces' in raw_atom_data: mol_dict['forces'] = raw_atom_data['forces']
-                if 'center_atoms_mask' in raw_atom_data: mol_dict['center_atoms_mask'] = raw_atom_data['center_atoms_mask']
 
             else:
                 # This branch is taken for inference XYZ files that don't have ground truth
                 print(f"Info: Molecule {mol_count} does not contain 'cs_tensor'. Assuming inference mode for this file.")
                 if 'pos' in raw_atom_data: mol_dict['pos'] = raw_atom_data['pos']
-                # Add center_atoms_mask (assume all atoms are relevant for inference)
-                mol_dict['center_atoms_mask'] = np.ones(num_atoms, dtype=bool)
 
             molecules_data.append(mol_dict)
             mol_count += 1
@@ -755,8 +810,7 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
     graph_level_keys = set()
 
     expected_atom_keys = {'pos', 'node_types', 'atom_rows', 'atom_cols',
-                          'cs_iso', 'cs_tensor', 'center_atoms_mask',
-                          'cs_tensor_spherical_std', 'cs_iso_std'}
+                          'cs_iso', 'cs_tensor', 'cs_tensor_spherical_std', 'cs_iso_std'}
 
     for key in all_keys:
         if key in expected_atom_keys:

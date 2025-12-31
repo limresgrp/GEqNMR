@@ -30,6 +30,14 @@ function App() {
   const [selectedBatch, setSelectedBatch] = useState(0);
   const [activeKeyDetails, setActiveKeyDetails] = useState(null);
   const [keyDetailsError, setKeyDetailsError] = useState('');
+  const [latticeMatrix, setLatticeMatrix] = useState([
+    ['1', '0', '0'],
+    ['0', '1', '0'],
+    ['0', '0', '1'],
+  ]);
+  const [latticeDetails, setLatticeDetails] = useState(null);
+  const [latticeError, setLatticeError] = useState('');
+  const [latticeSaving, setLatticeSaving] = useState(false);
 
   // 1. Fetch backend status on component load
   useEffect(() => {
@@ -127,6 +135,35 @@ function App() {
       });
   };
 
+  const fetchLatticeDetails = (batchIndex) => {
+    if (!preparedData?.id) {
+      return;
+    }
+    const hasLattice = preparedData.keys?.some((key) => key.name === 'Lattice');
+    if (!hasLattice) {
+      setLatticeDetails(null);
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (preparedData.num_molecules > 0) {
+      params.set('batch_index', batchIndex.toString());
+    }
+
+    fetch(`${API_URL}/prepare/${preparedData.id}/keys/Lattice?${params}`)
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to load lattice details');
+        return response.json();
+      })
+      .then(data => {
+        setLatticeDetails(data.key || null);
+      })
+      .catch(error => {
+        console.error('Lattice detail error:', error);
+        setLatticeDetails(null);
+      });
+  };
+
   const openResults = () => {
     setHighlightedResult('');
     setView('results');
@@ -155,6 +192,27 @@ function App() {
     if (!Number.isFinite(timestampSeconds)) return 'Unknown time';
     return new Date(timestampSeconds * 1000).toLocaleString();
   };
+
+  useEffect(() => {
+    const latticeSource = latticeDetails?.matrix
+      || (activeKeyDetails?.name === 'Lattice' ? activeKeyDetails.matrix : null);
+    if (latticeSource && Array.isArray(latticeSource)) {
+      const nextMatrix = latticeSource.map((row) =>
+        row.map((value) => (Number.isFinite(value) ? value.toString() : '0'))
+      );
+      if (nextMatrix.length === 3 && nextMatrix.every((row) => row.length === 3)) {
+        setLatticeMatrix(nextMatrix);
+        return;
+      }
+    }
+    if (preparedData && !preparedData.keys?.some((key) => key.name === 'Lattice')) {
+      setLatticeMatrix([
+        ['1', '0', '0'],
+        ['0', '1', '0'],
+        ['0', '0', '1'],
+      ]);
+    }
+  }, [latticeDetails, activeKeyDetails, preparedData]);
 
   const activeKey = activeKeyDetails || preparedData?.keys?.find((key) => key.name === selectedKey);
 
@@ -209,6 +267,86 @@ function App() {
     );
   };
 
+  const renderLatticePreview = (matrixValues) => {
+    if (!matrixValues || matrixValues.length !== 3) {
+      return <p className="text-sm text-gray-500">No lattice data available.</p>;
+    }
+
+    const vectors = matrixValues.map((row) => row.map((value) => parseFloat(value)));
+    const matrixValid = vectors.every((row) => row.length === 3 && row.every((value) => Number.isFinite(value)));
+    if (!matrixValid) {
+      return <p className="text-sm text-gray-500">Enter numeric lattice values to preview.</p>;
+    }
+
+    const flattened = vectors.flat();
+    if (flattened.every((value) => Math.abs(value) < 1e-6)) {
+      return <p className="text-sm text-gray-500">Lattice vectors are all zero.</p>;
+    }
+
+    const [a, b, c] = vectors;
+    const points3d = [
+      [0, 0, 0],
+      a,
+      b,
+      c,
+      [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+      [a[0] + c[0], a[1] + c[1], a[2] + c[2]],
+      [b[0] + c[0], b[1] + c[1], b[2] + c[2]],
+      [a[0] + b[0] + c[0], a[1] + b[1] + c[1], a[2] + b[2] + c[2]],
+    ];
+
+    const project = (point) => {
+      const [x, y, z] = point;
+      return [x - y, (x + y) / 2 - z];
+    };
+
+    const points2d = points3d.map(project);
+    const xs = points2d.map((point) => point[0]);
+    const ys = points2d.map((point) => point[1]);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const width = Math.max(maxX - minX, 1e-6);
+    const height = Math.max(maxY - minY, 1e-6);
+
+    const padding = 18;
+    const viewSize = 200;
+    const scale = Math.min((viewSize - padding * 2) / width, (viewSize - padding * 2) / height);
+
+    const toSvg = (point) => [
+      (point[0] - minX) * scale + padding,
+      (point[1] - minY) * scale + padding,
+    ];
+
+    const pointsSvg = points2d.map(toSvg);
+    const edges = [
+      [0, 1], [0, 2], [0, 3],
+      [1, 4], [1, 5],
+      [2, 4], [2, 6],
+      [3, 5], [3, 6],
+      [4, 7], [5, 7], [6, 7],
+    ];
+
+    return (
+      <svg viewBox={`0 0 ${viewSize} ${viewSize}`} className="w-full h-56">
+        <rect x="0" y="0" width={viewSize} height={viewSize} fill="transparent" stroke="#1f2937" />
+        {edges.map(([start, end]) => (
+          <line
+            key={`${start}-${end}`}
+            x1={pointsSvg[start][0]}
+            y1={pointsSvg[start][1]}
+            x2={pointsSvg[end][0]}
+            y2={pointsSvg[end][1]}
+            stroke="#34d399"
+            strokeWidth="2"
+            strokeLinecap="round"
+          />
+        ))}
+      </svg>
+    );
+  };
+
   // 2. Handle file selection from the input
   const handleFileChange = (event) => {
     setSelectedFile(event.target.files[0]);
@@ -221,6 +359,14 @@ function App() {
     setSelectedBatch(0);
     setActiveKeyDetails(null);
     setKeyDetailsError('');
+    setLatticeDetails(null);
+    setLatticeError('');
+    setLatticeSaving(false);
+    setLatticeMatrix([
+      ['1', '0', '0'],
+      ['0', '1', '0'],
+      ['0', '0', '1'],
+    ]);
   };
 
   // 3. Handle file upload and API call
@@ -288,6 +434,8 @@ function App() {
           setPreparedData(responseData);
           setSelectedKey(responseData.keys?.[0]?.name || '');
           setSelectedBatch(0);
+          setLatticeError('');
+          setLatticeSaving(false);
           setView('prepare');
         } else {
           throw new Error(responseData.detail || 'An unknown error occurred');
@@ -388,9 +536,50 @@ function App() {
       });
   };
 
+  const handleApplyLattice = () => {
+    if (!preparedData?.id) {
+      setLatticeError('Prepare an input before applying a lattice matrix.');
+      return;
+    }
+
+    const parsedMatrix = latticeMatrix.map((row) => row.map((value) => parseFloat(value)));
+    const matrixValid = parsedMatrix.every((row) => row.length === 3 && row.every((value) => Number.isFinite(value)));
+    if (!matrixValid) {
+      setLatticeError('Lattice matrix must contain numeric values for all 3x3 entries.');
+      return;
+    }
+
+    setLatticeSaving(true);
+    setLatticeError('');
+    fetch(`${API_URL}/prepare/${preparedData.id}/lattice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ matrix: parsedMatrix }),
+    })
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to apply lattice matrix');
+        return response.json();
+      })
+      .then(data => {
+        setPreparedData((prev) => (prev ? { ...prev, keys: data.keys || prev.keys } : prev));
+        setSelectedKey('Lattice');
+        fetchLatticeDetails(selectedBatch);
+      })
+      .catch(error => {
+        console.error('Lattice apply error:', error);
+        setLatticeError('Unable to apply lattice matrix.');
+      })
+      .finally(() => {
+        setLatticeSaving(false);
+      });
+  };
+
   useEffect(() => {
     if (preparedData?.id && selectedKey) {
       fetchKeyDetails(selectedKey, selectedBatch);
+    }
+    if (preparedData?.id) {
+      fetchLatticeDetails(selectedBatch);
     }
   }, [preparedData?.id, selectedKey, selectedBatch]);
   const downloadLink = outputFilePath ? `${API_URL}/download/${outputFilePath}` : '#';
@@ -579,62 +768,132 @@ function App() {
             )}
 
             {preparedData && (
-              <div className="grid gap-6 lg:grid-cols-2">
-                <div className="space-y-3">
-                  <div className="text-xs uppercase tracking-wide text-gray-400">Prepared Keys</div>
-                  <div className="space-y-2">
-                    {preparedData.keys.map((key) => {
-                      const isActive = key.name === selectedKey;
-                      return (
-                        <button
-                          key={key.name}
-                          type="button"
-                          onClick={() => setSelectedKey(key.name)}
-                          className={`w-full text-left rounded-md border px-4 py-3 transition ${
-                            isActive
-                              ? 'border-green-400 bg-gray-900/50'
-                              : 'border-gray-700 bg-gray-900/20 hover:bg-gray-900/40'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-semibold text-gray-100">{key.name}</span>
-                            <span className="text-xs text-gray-400">{key.shape.join('x')}</span>
-                          </div>
-                          <div className="text-xs text-gray-500">
-                            {key.dtype} · {key.size} values
-                          </div>
-                        </button>
-                      );
-                    })}
+              <div className="space-y-6">
+                <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4 space-y-4">
+                  <div>
+                    <h3 className="text-lg font-semibold text-gray-100">Lattice &amp; PBC</h3>
+                    <p className="text-xs text-gray-400">
+                      {preparedData.keys?.some((key) => key.name === 'Lattice')
+                        ? 'Lattice found in prepared input.'
+                        : 'No lattice found. You can add one below.'}
+                    </p>
                   </div>
-                  {preparedData.num_molecules > 1 && (
-                    <div className="mt-4">
-                      <label htmlFor="batch-select" className="block text-xs uppercase tracking-wide text-gray-400 mb-2">
-                        Batch index
-                      </label>
-                      <input
-                        id="batch-select"
-                        type="number"
-                        min={0}
-                        max={Math.max(preparedData.num_molecules - 1, 0)}
-                        value={selectedBatch}
-                        onChange={(event) => {
-                          const maxBatch = Math.max(preparedData.num_molecules - 1, 0);
-                          const nextValue = parseInt(event.target.value, 10);
-                          const clampedValue = Number.isNaN(nextValue)
-                            ? 0
-                            : Math.min(Math.max(nextValue, 0), maxBatch);
-                          setSelectedBatch(clampedValue);
-                        }}
-                        className="w-full rounded-md bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-gray-200
-                          focus:outline-none focus:ring-2 focus:ring-green-500"
-                      />
-                      <p className="text-xs text-gray-500 mt-1">
-                        Available batches: 0 - {Math.max(preparedData.num_molecules - 1, 0)}
-                      </p>
+                  <div className="flex flex-wrap gap-4 text-xs text-gray-300">
+                    {(() => {
+                      const pbcPresent = preparedData.keys?.find((key) => key.name === 'pbc_present');
+                      const pbcDetected = preparedData.keys?.find((key) => key.name === 'pbc_detected');
+                      const presentCount = pbcPresent?.counts?.true ?? 0;
+                      const detectedCount = pbcDetected?.counts?.true ?? 0;
+                      return (
+                        <>
+                          <span>Input lattice present: {presentCount > 0 ? 'Yes' : 'No'}</span>
+                          <span>MDAnalysis detected: {detectedCount > 0 ? 'Yes' : 'No'}</span>
+                        </>
+                      );
+                    })()}
+                  </div>
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-3 gap-2">
+                        {latticeMatrix.map((row, rowIndex) => (
+                          row.map((value, colIndex) => (
+                            <input
+                              key={`lattice-${rowIndex}-${colIndex}`}
+                              type="number"
+                              value={value}
+                              onChange={(event) => {
+                                const nextMatrix = latticeMatrix.map((matrixRow, rowIdx) =>
+                                  matrixRow.map((cellValue, colIdx) =>
+                                    rowIdx === rowIndex && colIdx === colIndex ? event.target.value : cellValue
+                                  )
+                                );
+                                setLatticeMatrix(nextMatrix);
+                              }}
+                              className="w-full rounded-md bg-gray-900 border border-gray-700 px-2 py-1 text-sm text-gray-200
+                                focus:outline-none focus:ring-2 focus:ring-green-500"
+                            />
+                          ))
+                        ))}
+                      </div>
+                      {latticeError && (
+                        <p className="text-xs text-red-400">{latticeError}</p>
+                      )}
+                      <button
+                        type="button"
+                        onClick={handleApplyLattice}
+                        disabled={latticeSaving || !preparedData}
+                        className="inline-flex items-center justify-center bg-green-600 text-white text-sm font-semibold py-2 px-4 rounded-md
+                          hover:bg-green-700 transition-colors duration-200 disabled:bg-gray-600 disabled:cursor-not-allowed"
+                      >
+                        {latticeSaving ? 'Applying...' : (preparedData.keys?.some((key) => key.name === 'Lattice') ? 'Update lattice matrix' : 'Apply lattice matrix')}
+                      </button>
                     </div>
-                  )}
+                    <div className="rounded-md border border-gray-700 bg-gray-900/60 p-3">
+                      <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">3D Box Preview</div>
+                      {renderLatticePreview(latticeMatrix)}
+                    </div>
+                  </div>
                 </div>
+
+                <div className="grid gap-6 lg:grid-cols-2">
+                  <div className="space-y-3">
+                    <div className="text-xs uppercase tracking-wide text-gray-400">Prepared Keys</div>
+                    <div className="space-y-2">
+                      {preparedData.keys.map((key) => {
+                        const isActive = key.name === selectedKey;
+                        return (
+                          <button
+                            key={key.name}
+                            type="button"
+                            onClick={() => setSelectedKey(key.name)}
+                            className={`w-full text-left rounded-md border px-4 py-3 transition ${
+                              isActive
+                                ? 'border-green-400 bg-gray-900/50'
+                                : 'border-gray-700 bg-gray-900/20 hover:bg-gray-900/40'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-semibold text-gray-100">{key.name}</span>
+                              <span className="text-xs text-gray-400">{key.shape.join('x')}</span>
+                            </div>
+                            <div className="flex items-center justify-between text-xs text-gray-500">
+                              <span>{key.dtype} · {key.size} values</span>
+                              {key.name === 'Lattice' && (
+                                <span className="text-xs text-green-300">3x3 matrix</span>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {preparedData.num_molecules > 1 && (
+                      <div className="mt-4">
+                        <label htmlFor="batch-select" className="block text-xs uppercase tracking-wide text-gray-400 mb-2">
+                          Batch index
+                        </label>
+                        <input
+                          id="batch-select"
+                          type="number"
+                          min={0}
+                          max={Math.max(preparedData.num_molecules - 1, 0)}
+                          value={selectedBatch}
+                          onChange={(event) => {
+                            const maxBatch = Math.max(preparedData.num_molecules - 1, 0);
+                            const nextValue = parseInt(event.target.value, 10);
+                            const clampedValue = Number.isNaN(nextValue)
+                              ? 0
+                              : Math.min(Math.max(nextValue, 0), maxBatch);
+                            setSelectedBatch(clampedValue);
+                          }}
+                          className="w-full rounded-md bg-gray-900 border border-gray-700 px-3 py-2 text-sm text-gray-200
+                            focus:outline-none focus:ring-2 focus:ring-green-500"
+                        />
+                        <p className="text-xs text-gray-500 mt-1">
+                          Available batches: 0 - {Math.max(preparedData.num_molecules - 1, 0)}
+                        </p>
+                      </div>
+                    )}
+                  </div>
 
                 <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
                   {activeKey ? (
@@ -655,38 +914,62 @@ function App() {
                         <div className="text-xs text-red-400">{keyDetailsError}</div>
                       )}
 
-                      {activeKey.stats && (
-                        <div className="grid grid-cols-2 gap-3 text-xs text-gray-300">
-                          <div>Min: {activeKey.stats.min ?? '—'}</div>
-                          <div>Max: {activeKey.stats.max ?? '—'}</div>
-                          <div>Mean: {activeKey.stats.mean ?? '—'}</div>
-                          <div>Std: {activeKey.stats.std ?? '—'}</div>
-                        </div>
-                      )}
-
-                      {activeKey.counts && (
-                        <div className="text-xs text-gray-300">
-                          True: {activeKey.counts.true} · False: {activeKey.counts.false}
-                        </div>
-                      )}
-
-                      {activeKey.sample && (
-                        <div>
-                          <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">Sample values</div>
-                          <div className="text-xs text-gray-200 bg-gray-900 rounded-md p-3 overflow-auto max-h-32">
-                            {JSON.stringify(activeKey.sample, null, 2)}
+                      {activeKey.name === 'Lattice' ? (
+                        <div className="space-y-4">
+                          <div className="grid grid-cols-3 gap-2 text-sm text-gray-200">
+                            {latticeMatrix.map((row, rowIndex) => (
+                              row.map((value, colIndex) => (
+                                <div
+                                  key={`lattice-detail-${rowIndex}-${colIndex}`}
+                                  className="rounded-md bg-gray-900 border border-gray-700 px-2 py-1 text-center"
+                                >
+                                  {value}
+                                </div>
+                              ))
+                            ))}
+                          </div>
+                          <div className="rounded-md border border-gray-700 bg-gray-900/60 p-3">
+                            <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">3D Box Preview</div>
+                            {renderLatticePreview(latticeMatrix)}
                           </div>
                         </div>
-                      )}
+                      ) : (
+                        <>
+                          {activeKey.stats && (
+                            <div className="grid grid-cols-2 gap-3 text-xs text-gray-300">
+                              <div>Min: {activeKey.stats.min ?? '—'}</div>
+                              <div>Max: {activeKey.stats.max ?? '—'}</div>
+                              <div>Mean: {activeKey.stats.mean ?? '—'}</div>
+                              <div>Std: {activeKey.stats.std ?? '—'}</div>
+                            </div>
+                          )}
 
-                      <div>
-                        <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">Distribution</div>
-                        {renderHistogram(activeKey.histogram, Boolean(activeKey.counts))}
-                      </div>
+                          {activeKey.counts && (
+                            <div className="text-xs text-gray-300">
+                              True: {activeKey.counts.true} · False: {activeKey.counts.false}
+                            </div>
+                          )}
+
+                          {activeKey.sample && (
+                            <div>
+                              <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">Sample values</div>
+                              <div className="text-xs text-gray-200 bg-gray-900 rounded-md p-3 overflow-auto max-h-32">
+                                {JSON.stringify(activeKey.sample, null, 2)}
+                              </div>
+                            </div>
+                          )}
+
+                          <div>
+                            <div className="text-xs uppercase tracking-wide text-gray-400 mb-2">Distribution</div>
+                            {renderHistogram(activeKey.histogram, Boolean(activeKey.counts))}
+                          </div>
+                        </>
+                      )}
                     </div>
                   ) : (
                     <p className="text-sm text-gray-400">Select a key to inspect its values.</p>
                   )}
+                </div>
                 </div>
               </div>
             )}

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import zipfile
@@ -11,7 +11,7 @@ import traceback
 import yaml
 import torch
 import numpy as np
-from typing import Optional
+from typing import Optional, List
 
 # Import core components and utility functions
 from . import processing
@@ -94,6 +94,15 @@ def _summarize_array(name: str, array: np.ndarray) -> dict:
 
     if array.size == 0:
         return summary
+
+    if name == "Lattice":
+        lattice = None
+        if array.shape == (3, 3):
+            lattice = array
+        elif array.size == 9:
+            lattice = array.reshape(3, 3)
+        if lattice is not None:
+            summary["matrix"] = lattice.astype(np.float64).tolist()
 
     kind = array.dtype.kind
     flat = array.reshape(-1)
@@ -367,6 +376,56 @@ def get_prepared_key(
             manifest.get("num_molecules", 0),
         )
     return {"key": summary}
+
+
+@app.post("/prepare/{prepared_id}/lattice")
+def set_prepared_lattice(
+    prepared_id: str,
+    payload: dict = Body(...),
+):
+    prepared_dir = PREPARED_DIR / prepared_id
+    if not prepared_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Prepared input not found.")
+
+    manifest = _load_prepared_manifest(prepared_dir)
+    npz_path = prepared_dir / manifest["npz_file"]
+    if not npz_path.is_file():
+        raise HTTPException(status_code=404, detail="Prepared dataset not found.")
+
+    matrix = payload.get("matrix")
+    if matrix is None:
+        raise HTTPException(status_code=400, detail="Missing lattice matrix.")
+
+    flat_values: List[float] = []
+    if isinstance(matrix, list) and len(matrix) == 3 and all(isinstance(row, list) for row in matrix):
+        for row in matrix:
+            if len(row) != 3:
+                raise HTTPException(status_code=400, detail="Lattice matrix must be 3x3.")
+            for value in row:
+                flat_values.append(float(value))
+    elif isinstance(matrix, list) and len(matrix) == 9:
+        flat_values = [float(value) for value in matrix]
+    else:
+        raise HTTPException(status_code=400, detail="Lattice matrix must be a 3x3 list or flat list of 9 values.")
+
+    lattice_matrix = np.array(flat_values, dtype=np.float32).reshape(3, 3)
+    num_molecules = int(manifest.get("num_molecules", 0))
+    if num_molecules <= 0:
+        raise HTTPException(status_code=400, detail="Invalid number of molecules for prepared input.")
+
+    with np.load(npz_path, allow_pickle=True) as data:
+        save_dict: dict = {key: data[key] for key in data.files}
+
+    save_dict["Lattice"] = np.tile(lattice_matrix, (num_molecules, 1, 1))
+    np.savez_compressed(npz_path, **save_dict)
+
+    manifest["lattice_override"] = True
+    _write_prepared_manifest(prepared_dir, manifest)
+
+    return {
+        "message": "Lattice matrix applied.",
+        "keys": summarize_npz(npz_path),
+    }
 
 
 @app.post("/infer/prepared/{prepared_id}")
