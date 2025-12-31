@@ -1,3 +1,4 @@
+import json
 import numpy as np
 import shlex
 from pathlib import Path
@@ -5,7 +6,9 @@ import torch
 from e3nn.o3 import Irreps
 import MDAnalysis as mda
 from MDAnalysis.exceptions import NoDataError
+from MDAnalysis.lib import mdamath
 import yaml
+from typing import Dict, Optional
 
 # --- Import from geqtrain (installed via pip) ---
 from .cartesian_to_spherical import convert_cartesian_to_spherical
@@ -19,6 +22,13 @@ MEAN_KEY_PREFIX = "_mean_"
 STD_KEY_PREFIX = "_std_"
 PER_TYPE_PREFIX = "per_type"
 GLOBAL_PREFIX = "global"
+
+STANDARDIZATION_METADATA_KEYS = [
+    f"{MEAN_KEY_PREFIX}.{PER_TYPE_PREFIX}.cs_iso",
+    f"{STD_KEY_PREFIX}.{PER_TYPE_PREFIX}.cs_iso",
+    f"{MEAN_KEY_PREFIX}.{PER_TYPE_PREFIX}.cs_tensor_spherical",
+    f"{STD_KEY_PREFIX}.{PER_TYPE_PREFIX}.cs_tensor_spherical",
+]
 
 ATOMIC_NUMBERS = {
     'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10,
@@ -55,7 +65,44 @@ def load_config_from_yaml(config_path: Path):
     except Exception as e:
         raise IOError(f"Failed to load config from {config_path}: {e}")
 
+
+def decode_metadata_array(raw_value: str) -> np.ndarray:
+    """Decode JSON-serialized ndarray metadata into a numpy array."""
+    payload = json.loads(raw_value)
+    if not isinstance(payload, dict) or payload.get("type") != "ndarray":
+        raise ValueError("Metadata entry is not a serialized ndarray.")
+    dtype = payload.get("dtype")
+    shape = payload.get("shape")
+    data = payload.get("data")
+    if dtype is None or shape is None or data is None:
+        raise ValueError("Serialized ndarray metadata is missing fields.")
+    return np.array(data, dtype=dtype).reshape(shape)
+
+
+def extract_standardization_stats(metadata: Dict[str, str]) -> Dict[str, np.ndarray]:
+    """Extract standardization statistics arrays from deployment metadata."""
+    stats: Dict[str, np.ndarray] = {}
+    for key in STANDARDIZATION_METADATA_KEYS:
+        raw_value = metadata.get(key)
+        if raw_value:
+            stats[key] = decode_metadata_array(raw_value)
+    return stats
+
 # --- FUNCTION: Save Predictions to PDB (Used for PDB/GRO input) ---
+
+def _clear_pdb_occupancy(pdb_path: Path):
+    lines = pdb_path.read_text().splitlines(keepends=True)
+    updated_lines = []
+    for line in lines:
+        if line.startswith(("ATOM", "HETATM")):
+            line_ending = "\n" if line.endswith("\n") else ""
+            line_body = line.rstrip("\n")
+            if len(line_body) >= 66:
+                line_body = f"{line_body[:54]}{' ' * 6}{line_body[60:]}"
+            line = line_body + line_ending
+        updated_lines.append(line)
+    pdb_path.write_text("".join(updated_lines))
+
 
 def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output_dir: Path):
     """
@@ -101,6 +148,7 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
             # Select only the current frame for writing
             universe.trajectory[i]
             atoms.write(str(frame_output_path))
+            _clear_pdb_occupancy(frame_output_path)
             output_paths.append(frame_output_path)
             atom_cursor += n_atoms_per_frame
         print(f"Saved {len(output_paths)} PDB files.")
@@ -110,6 +158,7 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
         output_path = output_dir / output_filename
         universe.atoms.tempfactors = b_factors_clipped
         atoms.write(str(output_path))
+        _clear_pdb_occupancy(output_path)
         output_paths.append(output_path)
         print(f"Predictions saved as B-factors to: {output_path}")
 
@@ -236,6 +285,11 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
 
             # Get positions
             mol_dict['pos'] = atoms.positions.astype(np.float32)
+
+            if ts.dimensions is not None and not np.allclose(ts.dimensions, 0.0):
+                box_matrix = mdamath.triclinic_vectors(ts.dimensions, dtype=np.float32)
+                if np.any(box_matrix):
+                    mol_dict['Lattice'] = box_matrix.reshape(-1)
 
             # Get atom types (Atomic Numbers)
             atom_types = np.zeros(num_atoms, dtype=np.int64)
@@ -700,9 +754,9 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
     atom_level_keys = set()
     graph_level_keys = set()
 
-    expected_atom_keys = {'pos', 'cs_tensor_spherical', 'cs_iso', 'center_atoms_mask',
-                          'forces', 'atom_types', 'atom_rows', 'atom_cols',
-                          'cs_tensor_spherical_std', 'cs_iso_std'} # Add std keys
+    expected_atom_keys = {'pos', 'node_types', 'atom_rows', 'atom_cols',
+                          'cs_iso', 'cs_tensor', 'center_atoms_mask',
+                          'cs_tensor_spherical_std', 'cs_iso_std'}
 
     for key in all_keys:
         if key in expected_atom_keys:
@@ -813,7 +867,12 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
 
 # --- Main Wrapper Function ---
 
-def process_uploaded_file(input_path: Path, output_dir: Path, trajectory_path: Path = None):
+def process_uploaded_file(
+    input_path: Path,
+    output_dir: Path,
+    trajectory_path: Path = None,
+    metadata_statistics: Optional[Dict[str, np.ndarray]] = None,
+):
     """
     Main function to process an uploaded file, route to the correct parser,
     and save the output.
@@ -824,7 +883,7 @@ def process_uploaded_file(input_path: Path, output_dir: Path, trajectory_path: P
     file_extension = input_path.suffix.lower()
     
     all_molecules_data = []
-    statistics = {}
+    statistics: Dict[str, np.ndarray] = {}
 
     if file_extension in [".pdb", ".gro", ".xyz"]:
         # Full processing for XYZ files (with ground truth)
@@ -832,8 +891,9 @@ def process_uploaded_file(input_path: Path, output_dir: Path, trajectory_path: P
         if not all_molecules_data:
             raise ValueError(f"Failed to parse any molecules from {file_extension.upper()} file.")
         
-        # Only compute stats if cs_tensor was present
-        if any("cs_tensor_spherical" in mol for mol in all_molecules_data):
+        if metadata_statistics:
+            statistics = metadata_statistics
+        elif any("cs_tensor_spherical" in mol for mol in all_molecules_data):
             statistics = compute_statistics(all_molecules_data, STANDARDIZATION_CONFIG)
             standardize_data(all_molecules_data, statistics, STANDARDIZATION_CONFIG)
         else:

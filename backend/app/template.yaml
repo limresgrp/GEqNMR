@@ -13,8 +13,12 @@ test_dataset_list:
       atom_rows__mask__: atom_rows__mask__
       atom_cols: atom_cols
       atom_cols__mask__: atom_cols__mask__
+      cs_iso_std: cs_iso
+      cs_iso_std__mask__: cs_iso__mask__
+      cs_tensor_spherical_std: cs_tensor
+      cs_tensor_spherical_std__mask__: cs_tensor__mask__
       _mean_.per_type.cs_iso: _mean_.per_type.cs_iso
       _std_.per_type.cs_iso: _std_.per_type.cs_iso
-      _mean_.per_type.cs_tensor_spherical: _mean_.per_type.cs_tensor_spherical
-      _std_.per_type.cs_tensor_spherical: _std_.per_type.cs_tensor_spherical
+      _mean_.per_type.cs_tensor_spherical: _mean_.per_type.cs_tensor
+      _std_.per_type.cs_tensor_spherical: _std_.per_type.cs_tensor
       Lattice: cell
