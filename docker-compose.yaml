@@ -18,6 +18,9 @@ services:
     working_dir: /workspaces/GEqNMR
     depends_on:
       - redis
+    environment:
+      GEQNMR_DATA_ROOT: ${GEQNMR_DATA_ROOT:-/workspaces/GEqNMR/outputs}
+      GEQNMR_MODELS_DIR: ${GEQNMR_MODELS_DIR:-/workspaces/GEqNMR/models}
     tty: true
 
   frontend:

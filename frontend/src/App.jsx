@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 
 // Base URL for the FastAPI backend
 const API_URL = 'http://localhost:8000';
@@ -25,6 +25,11 @@ function App() {
   const [uploadProgress, setUploadProgress] = useState(0);
   const [progressPhase, setProgressPhase] = useState('idle');
   const [preparedData, setPreparedData] = useState(null);
+  const [preparedInputs, setPreparedInputs] = useState([]);
+  const [selectedPreparedId, setSelectedPreparedId] = useState('');
+  const [preparedName, setPreparedName] = useState('');
+  const [prepareProgressMessage, setPrepareProgressMessage] = useState('');
+  const [frameSlice, setFrameSlice] = useState('');
   const [selectedKey, setSelectedKey] = useState('');
   const [prepareError, setPrepareError] = useState('');
   const [selectedBatch, setSelectedBatch] = useState(0);
@@ -38,6 +43,14 @@ function App() {
   const [latticeDetails, setLatticeDetails] = useState(null);
   const [latticeError, setLatticeError] = useState('');
   const [latticeSaving, setLatticeSaving] = useState(false);
+  const [predictionResults, setPredictionResults] = useState([]);
+  const [predictionResultsError, setPredictionResultsError] = useState('');
+  const [isLoadingPredictionResults, setIsLoadingPredictionResults] = useState(false);
+  const [selectedPredictionResults, setSelectedPredictionResults] = useState([]);
+  const [predictionDataByResult, setPredictionDataByResult] = useState({});
+  const [visualizationMode, setVisualizationMode] = useState('violin');
+  const [selectedAtomIds, setSelectedAtomIds] = useState([]);
+  const [selectedPairAtomIds, setSelectedPairAtomIds] = useState([]);
 
   // 1. Fetch backend status on component load
   useEffect(() => {
@@ -78,6 +91,124 @@ function App() {
       });
   };
 
+  const fetchPreparedInputs = () => {
+    fetch(`${API_URL}/prepared`)
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to load prepared inputs');
+        return response.json();
+      })
+      .then(data => {
+        setPreparedInputs(Array.isArray(data.prepared) ? data.prepared : []);
+      })
+      .catch(error => {
+        console.error('Prepared input list error:', error);
+        setPrepareError('Unable to load stored prepared inputs.');
+      });
+  };
+
+  const openPreparedInput = (preparedId) => {
+    if (!preparedId) {
+      setPreparedData(null);
+      setSelectedPreparedId('');
+      return;
+    }
+    setPrepareError('');
+    fetch(`${API_URL}/prepared/${encodeURIComponent(preparedId)}`)
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to load prepared input');
+        return response.json();
+      })
+      .then(data => {
+        setPreparedData(data);
+        setSelectedPreparedId(data.id);
+        setSelectedKey(data.keys?.[0]?.name || '');
+        setSelectedBatch(0);
+        setActiveKeyDetails(null);
+        setKeyDetailsError('');
+        setLatticeDetails(null);
+        setView('prepare');
+      })
+      .catch(error => {
+        console.error('Prepared detail error:', error);
+        setPrepareError('Unable to open the selected prepared input.');
+      });
+  };
+
+  const deletePreparedInput = (preparedId) => {
+    fetch(`${API_URL}/prepared/${encodeURIComponent(preparedId)}`, { method: 'DELETE' })
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to delete prepared input');
+        if (selectedPreparedId === preparedId) {
+          setPreparedData(null);
+          setSelectedPreparedId('');
+          setSelectedKey('');
+        }
+        fetchPreparedInputs();
+      })
+      .catch(error => {
+        console.error('Prepared delete error:', error);
+        setPrepareError('Unable to delete the selected prepared input.');
+      });
+  };
+
+  const pollPrepareJob = (jobId) => {
+    fetch(`${API_URL}/prepare/jobs/${jobId}`)
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to load prepare job');
+        return response.json();
+      })
+      .then(data => {
+        setUploadProgress(Math.round((data.progress || 0) * 100));
+        setPrepareProgressMessage(data.message || '');
+        if (data.status === 'completed') {
+          setIsUploading(false);
+          setProgressPhase('idle');
+          setUploadMessage('Input prepared and stored.');
+          setUploadMessageColor('text-green-500');
+          setPreparedData(data.result);
+          setSelectedPreparedId(data.result?.id || '');
+          setSelectedKey(data.result?.keys?.[0]?.name || '');
+          setSelectedBatch(0);
+          fetchPreparedInputs();
+          setView('prepare');
+          return;
+        }
+        if (data.status === 'failed') {
+          throw new Error(data.error || data.message || 'Preparation failed');
+        }
+        setTimeout(() => pollPrepareJob(jobId), 800);
+      })
+      .catch(error => {
+        console.error('Prepare job error:', error);
+        setIsUploading(false);
+        setProgressPhase('idle');
+        setUploadMessage(`Error: ${error.message}`);
+        setUploadMessageColor('text-red-500');
+        setPrepareError('Unable to prepare input data.');
+      });
+  };
+
+  const fetchPredictionResults = () => {
+    setIsLoadingPredictionResults(true);
+    setPredictionResultsError('');
+    fetch(`${API_URL}/prediction-results`)
+      .then(response => {
+        if (!response.ok) throw new Error('Failed to load prediction results');
+        return response.json();
+      })
+      .then(data => {
+        const list = Array.isArray(data.results) ? data.results : [];
+        setPredictionResults(list);
+        setIsLoadingPredictionResults(false);
+      })
+      .catch(error => {
+        console.error('Prediction result load error:', error);
+        setPredictionResults([]);
+        setPredictionResultsError('Unable to load prediction result metadata.');
+        setIsLoadingPredictionResults(false);
+      });
+  };
+
   // 1b. Fetch available models for selection
   useEffect(() => {
     fetch(`${API_URL}/models`)
@@ -104,7 +235,33 @@ function App() {
     if (view === 'results') {
       fetchResults();
     }
+    if (view === 'prepare') {
+      fetchPreparedInputs();
+    }
+    if (view === 'visualize') {
+      fetchPredictionResults();
+    }
   }, [view]);
+
+  useEffect(() => {
+    selectedPredictionResults.forEach((resultName) => {
+      if (predictionDataByResult[resultName]) {
+        return;
+      }
+      fetch(`${API_URL}/prediction-results/${encodeURIComponent(resultName)}`)
+        .then(response => {
+          if (!response.ok) throw new Error(`Failed to load ${resultName}`);
+          return response.json();
+        })
+        .then(data => {
+          setPredictionDataByResult((prev) => ({ ...prev, [resultName]: data }));
+        })
+        .catch(error => {
+          console.error('Prediction metadata error:', error);
+          setPredictionResultsError(`Unable to load prediction metadata for ${resultName}.`);
+        });
+    });
+  }, [selectedPredictionResults, predictionDataByResult]);
 
   const fetchKeyDetails = (keyName, batchIndex) => {
     if (!preparedData?.id || !keyName) {
@@ -215,6 +372,207 @@ function App() {
   }, [latticeDetails, activeKeyDetails, preparedData]);
 
   const activeKey = activeKeyDetails || preparedData?.keys?.find((key) => key.name === selectedKey);
+  const selectedPredictionData = selectedPredictionResults
+    .map((resultName) => predictionDataByResult[resultName])
+    .filter(Boolean);
+  const resultColors = ['#34d399', '#60a5fa', '#f59e0b', '#f472b6', '#a78bfa', '#22d3ee', '#fb7185', '#c084fc'];
+  const atomOptions = useMemo(() => {
+    const seen = new Map();
+    selectedPredictionData.forEach((result) => {
+      (result.atoms || []).forEach((atom) => {
+        if (!seen.has(atom.id)) {
+          seen.set(atom.id, { id: atom.id, label: atom.label || atom.id });
+        }
+      });
+    });
+    return Array.from(seen.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [selectedPredictionData]);
+
+  const getResultAtomValues = (result, atomId) => {
+    const atom = result?.atoms?.find((entry) => entry.id === atomId);
+    return Array.isArray(atom?.values) ? atom.values.filter((value) => Number.isFinite(value)) : [];
+  };
+
+  const renderViolinPlot = () => {
+    const selectedAtoms = atomOptions.filter((atom) => selectedAtomIds.includes(atom.id));
+    if (selectedPredictionData.length === 0 || selectedAtoms.length === 0) {
+      return <div className="text-sm text-gray-400">Select at least one result and one atom.</div>;
+    }
+
+    const series = [];
+    selectedAtoms.forEach((atom) => {
+      selectedPredictionData.forEach((result, resultIndex) => {
+        const values = getResultAtomValues(result, atom.id);
+        if (values.length > 0) {
+          series.push({ atom, result, resultIndex, values });
+        }
+      });
+    });
+    if (series.length === 0) {
+      return <div className="text-sm text-gray-400">No prediction values available for the selected atoms.</div>;
+    }
+
+    const allValues = series.flatMap((item) => item.values);
+    const minValue = Math.min(...allValues);
+    const maxValue = Math.max(...allValues);
+    const yMin = minValue === maxValue ? minValue - 1 : minValue;
+    const yMax = minValue === maxValue ? maxValue + 1 : maxValue;
+    const width = Math.max(760, selectedAtoms.length * 130);
+    const height = 420;
+    const margin = { top: 24, right: 24, bottom: 92, left: 62 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const yScale = (value) => margin.top + ((yMax - value) / (yMax - yMin)) * plotHeight;
+    const groupWidth = plotWidth / selectedAtoms.length;
+    const bins = 28;
+
+    return (
+      <div className="overflow-x-auto">
+        <svg viewBox={`0 0 ${width} ${height}`} className="min-w-full h-[420px]">
+          <rect x="0" y="0" width={width} height={height} fill="#111827" />
+          {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+            const value = yMin + (yMax - yMin) * tick;
+            const y = yScale(value);
+            return (
+              <g key={`y-${tick}`}>
+                <line x1={margin.left} x2={width - margin.right} y1={y} y2={y} stroke="#374151" strokeWidth="1" />
+                <text x={margin.left - 10} y={y + 4} textAnchor="end" fill="#9ca3af" fontSize="11">
+                  {value.toFixed(1)}
+                </text>
+              </g>
+            );
+          })}
+          {series.map((item) => {
+            const atomIndex = selectedAtoms.findIndex((atom) => atom.id === item.atom.id);
+            const resultCount = selectedPredictionData.length;
+            const centerX = margin.left + atomIndex * groupWidth + groupWidth / 2
+              + (item.resultIndex - (resultCount - 1) / 2) * Math.min(24, groupWidth / Math.max(resultCount, 1));
+            const color = resultColors[item.resultIndex % resultColors.length];
+            const counts = Array.from({ length: bins }, () => 0);
+            item.values.forEach((value) => {
+              const rawIndex = Math.floor(((value - yMin) / (yMax - yMin)) * bins);
+              const binIndex = Math.min(Math.max(rawIndex, 0), bins - 1);
+              counts[binIndex] += 1;
+            });
+            const maxCount = Math.max(...counts, 1);
+            const halfWidth = Math.min(26, groupWidth / Math.max(resultCount * 2.5, 3));
+            const leftPoints = counts.map((count, binIndex) => {
+              const value = yMin + ((binIndex + 0.5) / bins) * (yMax - yMin);
+              const x = centerX - (count / maxCount) * halfWidth;
+              return `${x},${yScale(value)}`;
+            });
+            const rightPoints = counts.slice().reverse().map((count, reverseIndex) => {
+              const binIndex = bins - 1 - reverseIndex;
+              const value = yMin + ((binIndex + 0.5) / bins) * (yMax - yMin);
+              const x = centerX + (count / maxCount) * halfWidth;
+              return `${x},${yScale(value)}`;
+            });
+            const mean = item.values.reduce((sum, value) => sum + value, 0) / item.values.length;
+            return (
+              <g key={`${item.result.result}-${item.atom.id}`}>
+                <polygon points={[...leftPoints, ...rightPoints].join(' ')} fill={color} opacity="0.42" stroke={color} strokeWidth="1.5" />
+                <line x1={centerX - halfWidth} x2={centerX + halfWidth} y1={yScale(mean)} y2={yScale(mean)} stroke={color} strokeWidth="2" />
+              </g>
+            );
+          })}
+          {selectedAtoms.map((atom, atomIndex) => {
+            const x = margin.left + atomIndex * groupWidth + groupWidth / 2;
+            return (
+              <text key={atom.id} x={x} y={height - 46} textAnchor="end" fill="#d1d5db" fontSize="11" transform={`rotate(-35 ${x} ${height - 46})`}>
+                {atom.label}
+              </text>
+            );
+          })}
+          <text x={18} y={height / 2} fill="#d1d5db" fontSize="12" transform={`rotate(-90 18 ${height / 2})`}>
+            Predicted cs
+          </text>
+        </svg>
+        <div className="flex flex-wrap gap-3 mt-3">
+          {selectedPredictionData.map((result, index) => (
+            <div key={result.result} className="flex items-center gap-2 text-xs text-gray-300">
+              <span className="h-3 w-3 rounded-full" style={{ backgroundColor: resultColors[index % resultColors.length] }} />
+              <span>{result.result}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderPairPlot = () => {
+    if (selectedPredictionData.length === 0 || selectedPairAtomIds.length !== 2) {
+      return <div className="text-sm text-gray-400">Select at least one result and exactly two atoms.</div>;
+    }
+    const [xAtomId, yAtomId] = selectedPairAtomIds;
+    const xAtom = atomOptions.find((atom) => atom.id === xAtomId);
+    const yAtom = atomOptions.find((atom) => atom.id === yAtomId);
+    const points = [];
+    selectedPredictionData.forEach((result, resultIndex) => {
+      const xs = getResultAtomValues(result, xAtomId);
+      const ys = getResultAtomValues(result, yAtomId);
+      const count = Math.min(xs.length, ys.length);
+      for (let index = 0; index < count; index += 1) {
+        points.push({ x: xs[index], y: ys[index], result, resultIndex });
+      }
+    });
+    if (points.length === 0) {
+      return <div className="text-sm text-gray-400">No paired values available for the selected atoms.</div>;
+    }
+    const xValues = points.map((point) => point.x);
+    const yValues = points.map((point) => point.y);
+    const minX = Math.min(...xValues);
+    const maxX = Math.max(...xValues);
+    const minY = Math.min(...yValues);
+    const maxY = Math.max(...yValues);
+    const xMin = minX === maxX ? minX - 1 : minX;
+    const xMax = minX === maxX ? maxX + 1 : maxX;
+    const yMin = minY === maxY ? minY - 1 : minY;
+    const yMax = minY === maxY ? maxY + 1 : maxY;
+    const width = 760;
+    const height = 460;
+    const margin = { top: 24, right: 28, bottom: 72, left: 70 };
+    const plotWidth = width - margin.left - margin.right;
+    const plotHeight = height - margin.top - margin.bottom;
+    const xScale = (value) => margin.left + ((value - xMin) / (xMax - xMin)) * plotWidth;
+    const yScale = (value) => margin.top + ((yMax - value) / (yMax - yMin)) * plotHeight;
+    return (
+      <div className="overflow-x-auto">
+        <svg viewBox={`0 0 ${width} ${height}`} className="min-w-full h-[460px]">
+          <rect x="0" y="0" width={width} height={height} fill="#111827" />
+          {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+            const xValue = xMin + (xMax - xMin) * tick;
+            const yValue = yMin + (yMax - yMin) * tick;
+            const x = xScale(xValue);
+            const y = yScale(yValue);
+            return (
+              <g key={`grid-${tick}`}>
+                <line x1={x} x2={x} y1={margin.top} y2={height - margin.bottom} stroke="#374151" strokeWidth="1" />
+                <line x1={margin.left} x2={width - margin.right} y1={y} y2={y} stroke="#374151" strokeWidth="1" />
+                <text x={x} y={height - margin.bottom + 20} textAnchor="middle" fill="#9ca3af" fontSize="11">{xValue.toFixed(1)}</text>
+                <text x={margin.left - 10} y={y + 4} textAnchor="end" fill="#9ca3af" fontSize="11">{yValue.toFixed(1)}</text>
+              </g>
+            );
+          })}
+          {points.map((point, index) => (
+            <circle
+              key={`${point.result.result}-${index}`}
+              cx={xScale(point.x)}
+              cy={yScale(point.y)}
+              r="3.5"
+              fill={resultColors[point.resultIndex % resultColors.length]}
+              opacity="0.48"
+            />
+          ))}
+          <text x={margin.left + plotWidth / 2} y={height - 24} textAnchor="middle" fill="#d1d5db" fontSize="12">
+            {xAtom?.label || xAtomId}
+          </text>
+          <text x={18} y={margin.top + plotHeight / 2} fill="#d1d5db" fontSize="12" transform={`rotate(-90 18 ${margin.top + plotHeight / 2})`}>
+            {yAtom?.label || yAtomId}
+          </text>
+        </svg>
+      </div>
+    );
+  };
 
   const renderHistogram = (histogram, isBoolean) => {
     if (!histogram || !Array.isArray(histogram.counts) || histogram.counts.length === 0) {
@@ -354,6 +712,10 @@ function App() {
     setTrajectoryFile(null); // Reset trajectory if main file changes
     setOutputFilePath(null); // Clear previous output
     setPreparedData(null);
+    setSelectedPreparedId('');
+    setPreparedName('');
+    setPrepareProgressMessage('');
+    setFrameSlice('');
     setSelectedKey('');
     setPrepareError('');
     setSelectedBatch(0);
@@ -392,6 +754,9 @@ function App() {
 
     const formData = new FormData();
     formData.append('file', selectedFile);
+    if (preparedName.trim()) {
+      formData.append('name', preparedName.trim());
+    }
 
     if (trajectoryFile) {
       formData.append('trajectory_file', trajectoryFile);
@@ -424,24 +789,28 @@ function App() {
       setProgressPhase('prepare');
     };
     xhr.onload = () => {
-      setIsUploading(false);
       setProgressPhase('idle');
       try {
         const responseData = JSON.parse(xhr.responseText || '{}');
         if (xhr.status >= 200 && xhr.status < 300) {
-          setUploadMessage('Input prepared. Review the prepared data below.');
-          setUploadMessageColor('text-green-500');
-          setPreparedData(responseData);
-          setSelectedKey(responseData.keys?.[0]?.name || '');
-          setSelectedBatch(0);
+          setUploadMessage('Upload complete. Preparing input...');
+          setUploadMessageColor('text-blue-500');
+          setProgressPhase('prepare');
+          setUploadProgress(0);
           setLatticeError('');
           setLatticeSaving(false);
-          setView('prepare');
+          if (responseData.job_id) {
+            pollPrepareJob(responseData.job_id);
+          } else {
+            throw new Error('Backend did not return a prepare job id');
+          }
         } else {
           throw new Error(responseData.detail || 'An unknown error occurred');
         }
       } catch (error) {
         console.error('Upload error:', error);
+        setIsUploading(false);
+        setProgressPhase('idle');
         setUploadMessage(`Error: ${error.message}`);
         setUploadMessageColor('text-red-500');
         setUploadProgress(0);
@@ -498,6 +867,9 @@ function App() {
     const formData = new FormData();
     formData.append('model_name', selectedModel);
     formData.append('destandardize', destandardize);
+    if (frameSlice.trim()) {
+      formData.append('frame_slice', frameSlice.trim());
+    }
 
     fetch(`${API_URL}/infer/prepared/${preparedData.id}`, {
       method: 'POST',
@@ -591,7 +963,7 @@ function App() {
   const progressLabel = progressPhase === 'upload'
     ? `Uploading ${uploadProgress}%`
     : progressPhase === 'prepare'
-      ? 'Preparing input...'
+      ? (prepareProgressMessage || 'Preparing input...')
       : progressPhase === 'inference'
         ? 'Running inference...'
         : '';
@@ -636,6 +1008,17 @@ function App() {
             >
               Results
             </button>
+            <button
+              type="button"
+              onClick={() => setView('visualize')}
+              className={`px-4 py-2 rounded-md text-sm font-semibold border ${
+                view === 'visualize'
+                  ? 'bg-gray-100 text-gray-900 border-gray-100'
+                  : 'bg-gray-800 text-gray-200 border-gray-700 hover:bg-gray-700'
+              }`}
+            >
+              Visualize
+            </button>
           </div>
         </div>
 
@@ -679,6 +1062,22 @@ function App() {
                   />
                 </div>
 
+                <div>
+                  <label htmlFor="prepared-name" className="block text-sm font-medium text-gray-400 mb-1">
+                    Stored input name
+                  </label>
+                  <input
+                    id="prepared-name"
+                    type="text"
+                    value={preparedName}
+                    onChange={(event) => setPreparedName(event.target.value)}
+                    placeholder={selectedFile?.name || 'Optional custom name'}
+                    className="block w-full text-sm text-gray-200 bg-gray-700 border border-gray-600 rounded-md
+                      py-2 px-3 focus:outline-none focus:ring-2 focus:ring-green-500"
+                    disabled={isUploading}
+                  />
+                </div>
+
                 {selectedFile && (
                   <div>
                     <label htmlFor="trajectory-upload" className="block text-sm font-medium text-gray-400 mb-1">
@@ -713,14 +1112,14 @@ function App() {
                 <div className="mt-5">
                   <div className="flex items-center justify-between text-xs uppercase tracking-wide text-gray-400 mb-2">
                     <span>{progressLabel}</span>
-                    {progressPhase === 'upload' && <span>{uploadProgress}%</span>}
+                    {(progressPhase === 'upload' || progressPhase === 'prepare') && <span>{uploadProgress}%</span>}
                   </div>
                   <div className="h-3 w-full rounded-full bg-gray-700 overflow-hidden">
                     <div
                       className={`h-full rounded-full ${
                         progressPhase === 'upload' ? 'bg-blue-500' : 'bg-green-500 animate-pulse'
                       }`}
-                      style={{ width: progressPhase === 'upload' ? `${uploadProgress}%` : '100%' }}
+                      style={{ width: progressPhase === 'inference' ? '100%' : `${uploadProgress}%` }}
                     />
                   </div>
                 </div>
@@ -744,9 +1143,9 @@ function App() {
           <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-6">
             <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
               <div>
-                <h2 className="text-2xl font-semibold text-gray-200">Prepared Input</h2>
+                <h2 className="text-2xl font-semibold text-gray-200">Prepared Inputs</h2>
                 <p className="text-sm text-gray-400">
-                  {preparedData ? `Input file: ${preparedData.input_file}` : 'No prepared input loaded yet.'}
+                  {preparedData ? `Selected: ${preparedData.name || preparedData.input_file}` : 'Select a stored input or upload a new one.'}
                 </p>
                 {preparedData?.num_molecules !== undefined && (
                   <p className="text-xs text-gray-500">
@@ -766,6 +1165,55 @@ function App() {
             {prepareError && (
               <div className="text-sm text-red-400">{prepareError}</div>
             )}
+
+            <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-xs uppercase tracking-wide text-gray-400">Stored inputs</div>
+                <button
+                  type="button"
+                  onClick={fetchPreparedInputs}
+                  className="text-xs text-green-300 hover:text-green-200"
+                >
+                  Refresh
+                </button>
+              </div>
+              {preparedInputs.length === 0 ? (
+                <p className="text-sm text-gray-500">No stored prepared inputs yet.</p>
+              ) : (
+                <div className="grid gap-3 md:grid-cols-2">
+                  {preparedInputs.map((item) => {
+                    const active = selectedPreparedId === item.id;
+                    return (
+                      <div
+                        key={item.id}
+                        className={`rounded-md border px-4 py-3 ${
+                          active ? 'border-green-400 bg-gray-900/70' : 'border-gray-700 bg-gray-900/30'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => openPreparedInput(item.id)}
+                          className="block w-full text-left"
+                        >
+                          <div className="text-sm font-semibold text-gray-100">{item.name}</div>
+                          <div className="text-xs text-gray-400">{item.input_file}</div>
+                          <div className="text-xs text-gray-500">
+                            {item.num_molecules} frame(s) · {formatTimestamp(item.modified)}
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deletePreparedInput(item.id)}
+                          className="mt-3 text-xs font-semibold text-red-300 hover:text-red-200"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
 
             {preparedData && (
               <div className="space-y-6">
@@ -981,7 +1429,7 @@ function App() {
                   <span className="text-xs text-red-400">{modelLoadError}</span>
                 )}
               </div>
-              <div className="grid gap-4 md:grid-cols-2">
+              <div className="grid gap-4 md:grid-cols-3">
                 <div>
                   <label htmlFor="model-select-prepare" className="block text-sm font-medium text-gray-400 mb-1">
                     Model
@@ -1005,6 +1453,23 @@ function App() {
                       No models found. Add .pth files to the backend models folder.
                     </p>
                   )}
+                </div>
+
+                <div>
+                  <label htmlFor="frame-slice" className="block text-sm font-medium text-gray-400 mb-1">
+                    Frame slice
+                  </label>
+                  <input
+                    id="frame-slice"
+                    type="text"
+                    value={frameSlice}
+                    onChange={(event) => setFrameSlice(event.target.value)}
+                    placeholder="start:stop:step"
+                    className="block w-full text-sm text-gray-200 bg-gray-700 border border-gray-600 rounded-md
+                      py-2 px-3 focus:outline-none focus:ring-2 focus:ring-green-500"
+                    disabled={isUploading}
+                  />
+                  <p className="text-xs text-gray-500 mt-1">Leave empty to infer all frames.</p>
                 </div>
 
                 <div className="flex items-center justify-center md:justify-start pt-6">
@@ -1170,6 +1635,172 @@ function App() {
                   </div>
                 );
               })}
+            </div>
+          </div>
+        )}
+
+        {view === 'visualize' && (
+          <div className="bg-gray-800 p-6 rounded-lg shadow-lg space-y-6">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h2 className="text-2xl font-semibold text-gray-200">Prediction Visualization</h2>
+                <p className="text-sm text-gray-400">
+                  Compare atom-wise predicted chemical shifts across saved inference results.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={fetchPredictionResults}
+                className="text-sm font-semibold px-4 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700"
+                disabled={isLoadingPredictionResults}
+              >
+                {isLoadingPredictionResults ? 'Loading...' : 'Refresh'}
+              </button>
+            </div>
+
+            {predictionResultsError && (
+              <div className="text-sm text-red-400">{predictionResultsError}</div>
+            )}
+
+            <div className="grid gap-6 lg:grid-cols-[280px_1fr]">
+              <div className="space-y-5">
+                <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+                  <div className="text-xs uppercase tracking-wide text-gray-400 mb-3">Results</div>
+                  {predictionResults.length === 0 && !isLoadingPredictionResults ? (
+                    <p className="text-sm text-gray-500">No prediction metadata found yet.</p>
+                  ) : (
+                    <div className="max-h-64 overflow-auto space-y-2">
+                      {predictionResults.map((result) => {
+                        const checked = selectedPredictionResults.includes(result.name);
+                        return (
+                          <label key={result.name} className="flex items-start gap-2 rounded-md border border-gray-700 bg-gray-900/30 px-3 py-2">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(event) => {
+                                if (event.target.checked) {
+                                  setSelectedPredictionResults((prev) => [...prev, result.name]);
+                                } else {
+                                  setSelectedPredictionResults((prev) => prev.filter((name) => name !== result.name));
+                                }
+                              }}
+                              className="mt-1 h-4 w-4 rounded border-gray-600 bg-gray-700 text-green-500 focus:ring-green-500"
+                            />
+                            <span>
+                              <span className="block text-sm text-gray-100 break-all">{result.name}</span>
+                              <span className="block text-xs text-gray-500">{formatTimestamp(result.modified)}</span>
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+                  <div className="text-xs uppercase tracking-wide text-gray-400 mb-3">Mode</div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setVisualizationMode('violin')}
+                      className={`rounded-md px-3 py-2 text-sm font-semibold border ${
+                        visualizationMode === 'violin'
+                          ? 'bg-green-500 text-gray-950 border-green-400'
+                          : 'bg-gray-900 text-gray-200 border-gray-700 hover:bg-gray-700'
+                      }`}
+                    >
+                      Violin
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setVisualizationMode('pair')}
+                      className={`rounded-md px-3 py-2 text-sm font-semibold border ${
+                        visualizationMode === 'pair'
+                          ? 'bg-green-500 text-gray-950 border-green-400'
+                          : 'bg-gray-900 text-gray-200 border-gray-700 hover:bg-gray-700'
+                      }`}
+                    >
+                      2D
+                    </button>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="text-xs uppercase tracking-wide text-gray-400">Atoms</div>
+                    {visualizationMode === 'violin' && atomOptions.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setSelectedAtomIds(atomOptions.map((atom) => atom.id))}
+                        className="text-xs text-green-300 hover:text-green-200"
+                      >
+                        Select all
+                      </button>
+                    )}
+                  </div>
+
+                  {atomOptions.length === 0 ? (
+                    <p className="text-sm text-gray-500">Select result files to load atom labels.</p>
+                  ) : visualizationMode === 'violin' ? (
+                    <div className="max-h-80 overflow-auto space-y-2">
+                      {atomOptions.map((atom) => (
+                        <label key={atom.id} className="flex items-center gap-2 text-sm text-gray-200">
+                          <input
+                            type="checkbox"
+                            checked={selectedAtomIds.includes(atom.id)}
+                            onChange={(event) => {
+                              if (event.target.checked) {
+                                setSelectedAtomIds((prev) => [...prev, atom.id]);
+                              } else {
+                                setSelectedAtomIds((prev) => prev.filter((id) => id !== atom.id));
+                              }
+                            }}
+                            className="h-4 w-4 rounded border-gray-600 bg-gray-700 text-green-500 focus:ring-green-500"
+                          />
+                          <span>{atom.label}</span>
+                        </label>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {atomOptions.map((atom) => {
+                        const checked = selectedPairAtomIds.includes(atom.id);
+                        return (
+                          <label key={atom.id} className="flex items-center gap-2 text-sm text-gray-200">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(event) => {
+                                if (event.target.checked) {
+                                  setSelectedPairAtomIds((prev) => [...prev, atom.id].slice(-2));
+                                } else {
+                                  setSelectedPairAtomIds((prev) => prev.filter((id) => id !== atom.id));
+                                }
+                              }}
+                              className="h-4 w-4 rounded border-gray-600 bg-gray-700 text-green-500 focus:ring-green-500"
+                            />
+                            <span>{atom.label}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-lg border border-gray-700 bg-gray-900/40 p-4 min-h-[520px]">
+                <div className="mb-4">
+                  <h3 className="text-lg font-semibold text-gray-100">
+                    {visualizationMode === 'violin' ? 'Atom Distributions' : 'Pair Distribution'}
+                  </h3>
+                  <p className="text-xs text-gray-500">
+                    {visualizationMode === 'violin'
+                      ? 'Each atom group contains one colored violin per selected result.'
+                      : 'Each point pairs frame-matched predictions for the two selected atoms.'}
+                  </p>
+                </div>
+                {visualizationMode === 'violin' ? renderViolinPlot() : renderPairPlot()}
+              </div>
             </div>
           </div>
         )}

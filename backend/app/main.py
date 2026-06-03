@@ -1,10 +1,12 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Body
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 import zipfile
 import shutil
 import tempfile
 import json
+import os
+import time
 import uuid
 from pathlib import Path
 import traceback
@@ -23,10 +25,12 @@ from geqtrain.train.components.dataset_builder import DatasetBuilder
 from geqtrain.data import AtomicDataDict # Assuming this holds keys like 'pos', 'node_types' etc.
 from geqtrain.train.components.inference import run_inference as geq_run_inference
 from geqtrain.utils.deploy import load_deployed_model
+from geqtrain.utils.inference_metadata import INFERENCE_METADATA_KEY, load_inference_metadata_bundle
 from geqtrain.utils._global_options import apply_global_config
 
-# --- Configuration (Hardcoded for this example) ---
-MODELS_DIR = Path("/workspaces/GEqNMR/models")
+# --- Configuration ---
+DATA_ROOT = Path(os.environ.get("GEQNMR_DATA_ROOT", "/workspaces/GEqNMR/outputs"))
+MODELS_DIR = Path(os.environ.get("GEQNMR_MODELS_DIR", "/workspaces/GEqNMR/models"))
 TEMPLATE_CONFIG = Path(__file__).parent / "template.yaml"
 
 # --- existing app definition ---
@@ -42,14 +46,21 @@ app.add_middleware(
 )
 
 # --- Define output directories ---
-OUTPUT_DIR = Path("/workspaces/GEqNMR/outputs")
+OUTPUT_DIR = DATA_ROOT
 RESULT_EXTENSIONS = {".pdb", ".xyz", ".zip"}
+RESULT_METADATA_SUFFIX = ".meta.json"
 PREPARED_DIR = OUTPUT_DIR / "prepared_inputs"
+PREPARE_JOBS = {}
 
 # Ensure directories exist on startup
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 PREPARED_DIR.mkdir(parents=True, exist_ok=True)
+for directory in (OUTPUT_DIR, MODELS_DIR, PREPARED_DIR):
+    try:
+        directory.chmod(0o755)
+    except OSError:
+        pass
 
 _SUMMARY_SAMPLE_SIZE = 20
 _SUMMARY_HIST_BINS = 20
@@ -69,9 +80,79 @@ def list_available_results():
                 "name": path.name,
                 "size_bytes": stat.st_size,
                 "modified": stat.st_mtime,
+                "has_predictions": _prediction_metadata_path(path).is_file(),
             })
     results.sort(key=lambda item: item["modified"], reverse=True)
     return results
+
+
+def _prediction_metadata_path(result_path: Path) -> Path:
+    return result_path.with_name(f"{result_path.name}{RESULT_METADATA_SUFFIX}")
+
+
+def _load_atom_labels_from_npz(npz_path: Path) -> List[str]:
+    with np.load(npz_path, allow_pickle=True) as data:
+        if "atom_labels" not in data.files:
+            return []
+        labels = data["atom_labels"]
+        if labels.ndim == 0:
+            return [str(labels.item())]
+        if labels.ndim >= 2:
+            labels = labels[0]
+        return [str(label) for label in labels.reshape(-1).tolist() if str(label)]
+
+
+def _write_prediction_metadata(
+    result_path: Path,
+    input_path: Path,
+    model_path: Path,
+    npz_path: Path,
+    predictions: np.ndarray,
+    destandardize: bool,
+    frame_slice: Optional[str] = None,
+    frame_indices: Optional[List[int]] = None,
+    prepared: Optional[dict] = None,
+):
+    atom_labels = _load_atom_labels_from_npz(npz_path)
+    if not atom_labels:
+        return
+    n_atoms = len(atom_labels)
+    flat_predictions = predictions.reshape(-1).astype(np.float64)
+    if flat_predictions.size % n_atoms != 0:
+        print(
+            f"Skipping prediction metadata for {result_path.name}: "
+            f"{flat_predictions.size} predictions are not divisible by {n_atoms} atoms."
+        )
+        return
+    n_frames = int(flat_predictions.size // n_atoms)
+    values_by_frame = flat_predictions.reshape(n_frames, n_atoms)
+    atoms = [
+        {
+            "id": atom_label,
+            "label": atom_label,
+            "index": atom_index,
+            "values": values_by_frame[:, atom_index].tolist(),
+        }
+        for atom_index, atom_label in enumerate(atom_labels)
+    ]
+    payload = {
+        "result": result_path.name,
+        "input_file": input_path.name,
+        "model": str(model_path),
+        "destandardized": bool(destandardize),
+        "frame_slice": frame_slice,
+        "frame_indices": frame_indices,
+        "prepared": prepared,
+        "num_frames": n_frames,
+        "num_atoms": n_atoms,
+        "atoms": atoms,
+    }
+    metadata_path = _prediction_metadata_path(result_path)
+    metadata_path.write_text(json.dumps(payload, indent=2))
+    try:
+        metadata_path.chmod(0o644)
+    except OSError:
+        pass
 
 
 def _safe_float(value):
@@ -223,6 +304,34 @@ def get_default_model_path() -> Path:
     return model_paths[0]
 
 
+def _disable_dataset_target_requirements(config: Config):
+    """Keep output normalization metadata, but do not require labels in uploaded inference inputs."""
+    config["loss_coeffs"] = []
+    normalization = config.get("normalization")
+    if not isinstance(normalization, dict):
+        return
+    for field, spec in list(normalization.items()):
+        if isinstance(spec, dict):
+            updated_spec = dict(spec)
+            updated_spec["apply_on_dataset"] = False
+            normalization[field] = updated_spec
+        elif isinstance(spec, str):
+            normalization[field] = {
+                "mode": spec,
+                "apply_on_dataset": False,
+            }
+
+
+def _make_inference_dataset_config(config: Config) -> Config:
+    dataset_config = Config(config.as_dict())
+    dataset_config["loss_coeffs"] = []
+    dataset_config["normalization"] = {}
+    for key in ("train_dataset_list", "validation_dataset_list", "dataset_list"):
+        if key in dataset_config:
+            dataset_config.pop(key)
+    return dataset_config
+
+
 @app.get("/")
 def read_root():
     """Root endpoint to check if the backend is alive."""
@@ -240,6 +349,23 @@ def list_models():
 @app.get("/results")
 def list_results():
     return {"results": list_available_results()}
+
+
+@app.get("/prediction-results")
+def list_prediction_results():
+    return {"results": [result for result in list_available_results() if result.get("has_predictions")]}
+
+
+@app.get("/prediction-results/{filename:path}")
+def get_prediction_result(filename: str):
+    result_path = resolve_result_path(filename)
+    metadata_path = _prediction_metadata_path(result_path)
+    if not metadata_path.is_file():
+        raise HTTPException(status_code=404, detail="Prediction metadata not found for this result.")
+    try:
+        return json.loads(metadata_path.read_text())
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail=f"Invalid prediction metadata: {e}")
 
 
 def resolve_result_path(filename: str) -> Path:
@@ -263,6 +389,7 @@ def delete_result(filename: str):
         raise HTTPException(status_code=404, detail="File not found.")
     try:
         file_path.unlink()
+        _prediction_metadata_path(file_path).unlink(missing_ok=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete file: {e}")
     return {"deleted": file_path.name}
@@ -271,6 +398,11 @@ def delete_result(filename: str):
 def _write_prepared_manifest(prepared_dir: Path, manifest: dict):
     manifest_path = prepared_dir / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
+    try:
+        prepared_dir.chmod(0o755)
+        manifest_path.chmod(0o644)
+    except OSError:
+        pass
 
 
 def _load_prepared_manifest(prepared_dir: Path) -> dict:
@@ -283,18 +415,144 @@ def _load_prepared_manifest(prepared_dir: Path) -> dict:
         raise HTTPException(status_code=500, detail=f"Invalid prepared input manifest: {e}")
 
 
+def _prepared_summary(prepared_dir: Path) -> dict:
+    manifest = _load_prepared_manifest(prepared_dir)
+    stat = prepared_dir.stat()
+    return {
+        "id": prepared_dir.name,
+        "name": manifest.get("name") or manifest.get("input_file") or prepared_dir.name,
+        "input_file": manifest.get("input_file"),
+        "trajectory_file": manifest.get("trajectory_file"),
+        "npz_file": manifest.get("npz_file"),
+        "num_molecules": manifest.get("num_molecules", 0),
+        "created": manifest.get("created", stat.st_ctime),
+        "modified": stat.st_mtime,
+    }
+
+
+def _resolve_prepared_dir(prepared_id: str) -> Path:
+    prepared_dir = PREPARED_DIR / Path(prepared_id).name
+    if not prepared_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Prepared input not found.")
+    return prepared_dir
+
+
+def _prepared_detail(prepared_id: str) -> dict:
+    prepared_dir = _resolve_prepared_dir(prepared_id)
+    manifest = _load_prepared_manifest(prepared_dir)
+    npz_path = prepared_dir / manifest["npz_file"]
+    if not npz_path.is_file():
+        raise HTTPException(status_code=404, detail="Prepared dataset not found.")
+    return {
+        **_prepared_summary(prepared_dir),
+        "keys": summarize_npz(npz_path),
+    }
+
+
+def _set_prepare_job(job_id: str, status: str, progress: float, message: str, result: Optional[dict] = None, error: Optional[str] = None):
+    PREPARE_JOBS[job_id] = {
+        **PREPARE_JOBS.get(job_id, {}),
+        "id": job_id,
+        "status": status,
+        "progress": max(0.0, min(1.0, float(progress))),
+        "message": message,
+        "result": result,
+        "error": error,
+    }
+
+
+def _parse_frame_slice(frame_slice: Optional[str], num_frames: int) -> Optional[List[int]]:
+    if frame_slice is None or str(frame_slice).strip() == "":
+        return None
+    raw = str(frame_slice).strip()
+    parts = raw.split(":")
+    if len(parts) > 3:
+        raise HTTPException(status_code=400, detail="Frame slice must use start:stop:step syntax.")
+    values = []
+    for part in parts:
+        values.append(None if part == "" else int(part))
+    while len(values) < 3:
+        values.append(None)
+    start, stop, step = values
+    if step == 0:
+        raise HTTPException(status_code=400, detail="Frame slice step cannot be zero.")
+    indices = list(range(num_frames))[slice(start, stop, step)]
+    if not indices:
+        raise HTTPException(status_code=400, detail="Frame slice selected no frames.")
+    return indices
+
+
+def _slice_prepared_npz(source_npz: Path, output_dir: Path, frame_indices: Optional[List[int]], num_frames: int) -> Path:
+    if frame_indices is None:
+        return source_npz
+    sliced_npz = output_dir / f"{source_npz.stem}_frames_{uuid.uuid4().hex[:8]}.npz"
+    with np.load(source_npz, allow_pickle=True) as data:
+        save_dict = {}
+        for key in data.files:
+            value = data[key]
+            if value.ndim > 0 and value.shape[0] == num_frames:
+                save_dict[key] = value[frame_indices]
+            else:
+                save_dict[key] = value
+    np.savez_compressed(sliced_npz, **save_dict)
+    try:
+        sliced_npz.chmod(0o644)
+    except OSError:
+        pass
+    return sliced_npz
+
+
+def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, input_path: Path, input_filename: str, trajectory_input_path: Optional[Path], trajectory_filename: Optional[str], custom_name: Optional[str]):
+    try:
+        def progress(value: float, message: str):
+            _set_prepare_job(job_id, "running", value, message)
+
+        _set_prepare_job(job_id, "running", 0.01, "Saved uploaded files")
+        npz_output_path, num_molecules = processing.process_uploaded_file(
+            input_path,
+            prepared_dir,
+            trajectory_input_path,
+            progress_callback=progress,
+        )
+        manifest = {
+            "id": prepared_id,
+            "name": custom_name or input_filename,
+            "input_file": input_filename,
+            "trajectory_file": trajectory_filename,
+            "npz_file": npz_output_path.name,
+            "num_molecules": num_molecules,
+            "created": time.time(),
+        }
+        _write_prepared_manifest(prepared_dir, manifest)
+        result = {
+            **_prepared_detail(prepared_id),
+        }
+        _set_prepare_job(job_id, "completed", 1.0, "Prepared input is ready", result=result)
+    except Exception as e:
+        traceback.print_exc()
+        shutil.rmtree(prepared_dir, ignore_errors=True)
+        _set_prepare_job(job_id, "failed", 1.0, f"Failed to prepare input: {e}", error=str(e))
+
+
 @app.post("/prepare")
 async def prepare_input(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     trajectory_file: UploadFile = File(None),
+    name: str = Form(None),
 ):
     file_extension = file.filename.split('.')[-1].lower()
     if file_extension not in ["pdb", "gro", "xyz"]:
         raise HTTPException(status_code=400, detail="Only .pdb, .gro, or .xyz files are supported.")
 
     prepared_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
     prepared_dir = PREPARED_DIR / prepared_id
     prepared_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        prepared_dir.chmod(0o755)
+    except OSError:
+        pass
 
     input_filename = Path(file.filename).name
     input_path = prepared_dir / input_filename
@@ -304,6 +562,7 @@ async def prepare_input(
     try:
         with input_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        input_path.chmod(0o644)
     except Exception as e:
         shutil.rmtree(prepared_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Could not save uploaded file: {e}")
@@ -316,39 +575,58 @@ async def prepare_input(
         try:
             with trajectory_input_path.open("wb") as buffer:
                 shutil.copyfileobj(trajectory_file.file, buffer)
+            trajectory_input_path.chmod(0o644)
         except Exception as e:
             shutil.rmtree(prepared_dir, ignore_errors=True)
             raise HTTPException(status_code=500, detail=f"Could not save uploaded trajectory file: {e}")
         finally:
             trajectory_file.file.close()
 
-    try:
-        npz_output_path, num_molecules = processing.process_uploaded_file(
-            input_path,
-            prepared_dir,
-            trajectory_input_path,
-        )
-        summary = summarize_npz(npz_output_path)
-    except Exception as e:
-        shutil.rmtree(prepared_dir, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=f"Failed to prepare input for inference: {e}")
+    _set_prepare_job(job_id, "queued", 0.0, "Queued input preparation")
+    background_tasks.add_task(
+        _process_prepare_job,
+        job_id,
+        prepared_id,
+        prepared_dir,
+        input_path,
+        input_filename,
+        trajectory_input_path,
+        trajectory_filename,
+        name.strip() if isinstance(name, str) and name.strip() else None,
+    )
+    return {"job_id": job_id, "prepared_id": prepared_id, "status": "queued"}
 
-    manifest = {
-        "input_file": input_filename,
-        "trajectory_file": trajectory_filename,
-        "npz_file": npz_output_path.name,
-        "num_molecules": num_molecules,
-    }
-    _write_prepared_manifest(prepared_dir, manifest)
 
-    return {
-        "id": prepared_id,
-        "input_file": input_filename,
-        "trajectory_file": trajectory_filename,
-        "npz_file": npz_output_path.name,
-        "num_molecules": num_molecules,
-        "keys": summary,
-    }
+@app.get("/prepare/jobs/{job_id}")
+def get_prepare_job(job_id: str):
+    job = PREPARE_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Prepare job not found.")
+    return job
+
+
+@app.get("/prepared")
+def list_prepared_inputs():
+    prepared = []
+    for prepared_dir in sorted(PREPARED_DIR.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
+        if prepared_dir.is_dir() and (prepared_dir / "manifest.json").is_file():
+            try:
+                prepared.append(_prepared_summary(prepared_dir))
+            except HTTPException:
+                continue
+    return {"prepared": prepared}
+
+
+@app.get("/prepared/{prepared_id}")
+def get_prepared_input(prepared_id: str):
+    return _prepared_detail(prepared_id)
+
+
+@app.delete("/prepared/{prepared_id}")
+def delete_prepared_input(prepared_id: str):
+    prepared_dir = _resolve_prepared_dir(prepared_id)
+    shutil.rmtree(prepared_dir, ignore_errors=True)
+    return {"deleted": prepared_id}
 
 
 @app.get("/prepare/{prepared_id}/keys/{key_name}")
@@ -357,9 +635,7 @@ def get_prepared_key(
     key_name: str,
     batch_index: Optional[int] = None,
 ):
-    prepared_dir = PREPARED_DIR / prepared_id
-    if not prepared_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Prepared input not found.")
+    prepared_dir = _resolve_prepared_dir(prepared_id)
 
     manifest = _load_prepared_manifest(prepared_dir)
     npz_path = prepared_dir / manifest["npz_file"]
@@ -383,9 +659,7 @@ def set_prepared_lattice(
     prepared_id: str,
     payload: dict = Body(...),
 ):
-    prepared_dir = PREPARED_DIR / prepared_id
-    if not prepared_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Prepared input not found.")
+    prepared_dir = _resolve_prepared_dir(prepared_id)
 
     manifest = _load_prepared_manifest(prepared_dir)
     npz_path = prepared_dir / manifest["npz_file"]
@@ -433,10 +707,9 @@ async def infer_prepared_input(
     prepared_id: str,
     model_name: str = Form(None),
     destandardize: bool = Form(True),
+    frame_slice: str = Form(None),
 ):
-    prepared_dir = PREPARED_DIR / prepared_id
-    if not prepared_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Prepared input not found.")
+    prepared_dir = _resolve_prepared_dir(prepared_id)
 
     manifest = _load_prepared_manifest(prepared_dir)
     input_path = prepared_dir / manifest["input_file"]
@@ -463,11 +736,13 @@ async def infer_prepared_input(
             model_path=model_path,
             trajectory_path=trajectory_input_path,
             prepared_npz_path=npz_path,
+            frame_slice=frame_slice,
+            prepared_context=_prepared_summary(prepared_dir),
         )
-        shutil.rmtree(prepared_dir, ignore_errors=True)
         return {
             "message": "Inference complete. Structure file with predictions generated.",
             "input_file": manifest["input_file"],
+            "prepared_id": prepared_id,
             "model": str(model_path),
             "output_file": str(output_path),
             "atoms_predicted": num_atoms_predicted,
@@ -488,6 +763,8 @@ async def run_inference_workflow(
     model_path: Path,
     trajectory_path: Path = None,
     prepared_npz_path: Path = None,
+    frame_slice: Optional[str] = None,
+    prepared_context: Optional[dict] = None,
 ):
     """
     Orchestrates loading, inference, and file saving for an uploaded structure file.
@@ -517,6 +794,10 @@ async def run_inference_workflow(
         )
 
     metadata_stats = processing.extract_standardization_stats(metadata)
+    inference_metadata = load_inference_metadata_bundle(metadata.get(INFERENCE_METADATA_KEY, ""))
+    has_inference_normalization_stats = bool(
+        inference_metadata.get("normalization_stats_by_ensemble")
+    )
 
     # 2. Load metadata config and merge template overrides
     try:
@@ -530,30 +811,44 @@ async def run_inference_workflow(
 
         test_config = Config.from_file(TEMPLATE_CONFIG)
         config.update(test_config)
+        _disable_dataset_target_requirements(config)
         # Set batch size for inference
         config['batch_size'] = config.get('batch_size', 1)
+        config["denormalize_inference_outputs"] = bool(destandardize and has_inference_normalization_stats)
         apply_global_config(config.as_dict(), warn_on_override=False)
         print("Configuration loaded and merged.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to load or merge configuration: {e}")
     def run_inference_from_npz(npz_output_path: Path, cleanup_npz: bool):
         # 3. Create the dataset from the generated NPZ
+        frame_indices = None
+        inference_npz_path = npz_output_path
+        sliced_npz_path = None
         try:
+            with np.load(npz_output_path, allow_pickle=True) as npz_data:
+                num_frames = int(npz_data["pos"].shape[0]) if "pos" in npz_data.files and npz_data["pos"].ndim > 0 else 0
+            frame_indices = _parse_frame_slice(frame_slice, num_frames)
+            if frame_indices is not None:
+                sliced_npz_path = _slice_prepared_npz(npz_output_path, Path(config["root"]), frame_indices, num_frames)
+                inference_npz_path = sliced_npz_path
             # Temporarily update the dataset_input in the config to point to the new NPZ file
-            config['test_dataset_list'][0]['dataset_input'] = str(npz_output_path)
+            config['test_dataset_list'][0]['dataset_input'] = str(inference_npz_path)
 
-            builder = DatasetBuilder(config, np.random.default_rng(config.get('dataset_seed', 42)))
+            dataset_config = _make_inference_dataset_config(config)
+            builder = DatasetBuilder(dataset_config, np.random.default_rng(config.get('dataset_seed', 42)))
             inference_dset = builder.build_test()
             dataloader = DataLoader(inference_dset, batch_size=config['batch_size'], shuffle=False)
             print(f"DatasetBuilder created DataLoader with {len(inference_dset)} structures.")
         except Exception as e:
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
+            if sliced_npz_path is not None:
+                sliced_npz_path.unlink(missing_ok=True)
             raise HTTPException(status_code=500, detail=f"Failed to build inference dataset: {e}")
 
         # 4. Run Inference
         mean_per_type, std_per_type = None, None
-        if destandardize:
+        if destandardize and not has_inference_normalization_stats:
             # --- Load standardization stats from deployment metadata ---
             try:
                 mean_per_type_np = metadata_stats.get("_mean_.per_type.cs_iso")
@@ -594,7 +889,8 @@ async def run_inference_workflow(
                     # Run inference without loss/metrics logic
                     out, _, _, _ = geq_run_inference(
                         model=model, data=data, device=device,
-                        loss_fn=None, config=config.as_dict(), is_train=False
+                        loss_fn=None, config=config.as_dict(), is_train=False,
+                        inference_metadata=inference_metadata,
                     )
                     
                     # Extract predicted isotropic component ('cs_iso')
@@ -608,7 +904,7 @@ async def run_inference_workflow(
                         raise KeyError("Model output is missing 'cs_tensor_spherical' or 'cs_iso'. Cannot extract isotropic shift.")
                     
                     # --- Conditionally De-standardize the predictions ---
-                    if destandardize:
+                    if destandardize and not has_inference_normalization_stats:
                         # 1. Get atom types for the current batch
                         atom_types = data[AtomicDataDict.NODE_TYPE_KEY].flatten()
                         
@@ -635,7 +931,8 @@ async def run_inference_workflow(
                 output_paths, is_trajectory = processing.save_predictions_to_pdb(
                     input_path=input_path,
                     predictions_np=final_predictions,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    frame_indices=frame_indices,
                 )
 
                 # If it's a PDB trajectory, zip the individual frame files
@@ -655,14 +952,34 @@ async def run_inference_workflow(
                 final_output_path = processing.save_predictions_to_xyz(
                     input_xyz_path=input_path,
                     predictions_np=final_predictions,
-                    output_dir=output_dir
+                    output_dir=output_dir,
+                    frame_indices=frame_indices,
                 )
             else:
                 raise ValueError(f"Unsupported file type for saving predictions: {file_extension}")
 
+            try:
+                final_output_path.chmod(0o644)
+            except OSError:
+                pass
+
+            _write_prediction_metadata(
+                result_path=final_output_path,
+                input_path=input_path,
+                model_path=model_path,
+                npz_path=npz_output_path,
+                predictions=final_predictions,
+                destandardize=destandardize,
+                frame_slice=frame_slice,
+                frame_indices=frame_indices,
+                prepared=prepared_context,
+            )
+
             # 6. Cleanup temporary NPZ file
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
+            if sliced_npz_path is not None:
+                sliced_npz_path.unlink(missing_ok=True)
             
             print("--- Inference Workflow Complete ---")
             return final_output_path, final_predictions.shape[0]
@@ -672,6 +989,8 @@ async def run_inference_workflow(
             traceback.print_exc()
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
+            if sliced_npz_path is not None:
+                sliced_npz_path.unlink(missing_ok=True)
             raise HTTPException(status_code=500, detail=f"Error during model inference or file saving: {e}")
 
     if prepared_npz_path:

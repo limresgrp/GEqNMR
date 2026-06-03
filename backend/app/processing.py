@@ -8,7 +8,7 @@ import MDAnalysis as mda
 from MDAnalysis.exceptions import NoDataError
 from MDAnalysis.lib import mdamath
 import yaml
-from typing import Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 # --- Import from geqtrain (installed via pip) ---
 from .cartesian_to_spherical import convert_cartesian_to_spherical
@@ -55,6 +55,15 @@ PERIODIC_TABLE_INFO = {
 ATOMIC_SYMBOLS = {v: k for k, v in ATOMIC_NUMBERS.items()}
 # Add symbol for unrecognized atoms (index 0)
 ATOMIC_SYMBOLS[0] = 'X' 
+
+
+def _format_atom_label(atom, fallback_element: str, atom_index: int, is_xyz: bool) -> str:
+    if is_xyz:
+        return f"{fallback_element}_{atom_index + 1}"
+    atom_name = str(getattr(atom, "name", "") or fallback_element or "X").strip() or "X"
+    resname = str(getattr(atom, "resname", "") or "UNK").strip() or "UNK"
+    resid = getattr(atom, "resid", atom_index + 1)
+    return f"{atom_name}_{resname}_{resid}"
 
 # --- NEW UTILITY: Load YAML Config ---
 def load_config_from_yaml(config_path: Path):
@@ -104,7 +113,7 @@ def _clear_pdb_occupancy(pdb_path: Path):
     pdb_path.write_text("".join(updated_lines))
 
 
-def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output_dir: Path):
+def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output_dir: Path, frame_indices: Optional[List[int]] = None):
     """
     Loads a structure, updates the B-factor column with predictions, and saves new PDB file(s).
     If the input is a trajectory (multi-frame), it saves one PDB per frame.
@@ -118,13 +127,15 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
     # Calculate the total number of atoms in the entire trajectory
     n_atoms_per_frame = len(atoms)
     total_frames = len(universe.trajectory)
+    selected_frame_indices = frame_indices if frame_indices is not None else list(range(total_frames))
     total_atoms_predicted = n_atoms_per_frame * total_frames
+    expected_atoms_predicted = n_atoms_per_frame * len(selected_frame_indices)
     
     # Ensure predictions match the total number of atoms in all frames
-    if len(predictions_np) != total_atoms_predicted:
+    if len(predictions_np) != expected_atoms_predicted:
         raise ValueError(
-            f"Prediction count ({len(predictions_np)}) does not match total atom count ({total_atoms_predicted}) "
-            f"in the structure file ({n_atoms_per_frame} atoms * {total_frames} frames). Aborting PDB writing."
+            f"Prediction count ({len(predictions_np)}) does not match selected atom count ({expected_atoms_predicted}) "
+            f"in the structure file ({n_atoms_per_frame} atoms * {len(selected_frame_indices)} selected frames). Aborting PDB writing."
         )
     
     # MDAnalysis automatically handles B-factor (tempfactors) as a float array
@@ -132,21 +143,21 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
     b_factors = predictions_np.reshape(-1).astype(np.float32)
     b_factors_clipped = np.clip(b_factors, -999.99, 999.99)
     
-    is_trajectory = total_frames > 1
+    is_trajectory = len(selected_frame_indices) > 1
     output_paths = []
 
     if is_trajectory:
         print(f"Detected trajectory with {total_frames} frames. Saving each frame as a separate PDB.")
         atom_cursor = 0
-        for i, ts in enumerate(universe.trajectory):
+        for output_idx, frame_idx in enumerate(selected_frame_indices):
+            universe.trajectory[frame_idx]
             frame_predictions = b_factors_clipped[atom_cursor : atom_cursor + n_atoms_per_frame]
             universe.atoms.tempfactors = frame_predictions
             
-            output_filename = f"{input_path.stem}_inferred_frame_{i+1}.pdb"
+            output_filename = f"{input_path.stem}_inferred_frame_{frame_idx+1}.pdb"
             frame_output_path = output_dir / output_filename
             
             # Select only the current frame for writing
-            universe.trajectory[i]
             atoms.write(str(frame_output_path))
             _clear_pdb_occupancy(frame_output_path)
             output_paths.append(frame_output_path)
@@ -156,6 +167,7 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
         # Single frame file
         output_filename = f"{input_path.stem}_inferred.pdb"
         output_path = output_dir / output_filename
+        universe.trajectory[selected_frame_indices[0]]
         universe.atoms.tempfactors = b_factors_clipped
         atoms.write(str(output_path))
         _clear_pdb_occupancy(output_path)
@@ -165,7 +177,7 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
     return output_paths, is_trajectory
 
 
-def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, output_dir: Path):
+def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, output_dir: Path, frame_indices: Optional[List[int]] = None):
     """
     Reads an XYZ structure, appends cs_iso predictions as a new column,
     and saves an extended XYZ file.
@@ -184,11 +196,13 @@ def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, ou
         
     n_atoms_per_frame = len(universe.atoms)
     total_frames = len(universe.trajectory)
+    selected_frame_indices = frame_indices if frame_indices is not None else list(range(total_frames))
     total_atoms_predicted = n_atoms_per_frame * total_frames
+    expected_atoms_predicted = n_atoms_per_frame * len(selected_frame_indices)
     
-    if len(predictions_np) != total_atoms_predicted:
+    if len(predictions_np) != expected_atoms_predicted:
         raise ValueError(
-            f"Prediction count ({len(predictions_np)}) does not match total atom count ({total_atoms_predicted}) "
+            f"Prediction count ({len(predictions_np)}) does not match selected atom count ({expected_atoms_predicted}) "
             "in the structure file. Aborting XYZ writing."
         )
 
@@ -211,7 +225,8 @@ def save_predictions_to_xyz(input_xyz_path: Path, predictions_np: np.ndarray, ou
 
     with open(output_path, 'w') as f:
         atom_cursor = 0
-        for ts_idx, ts in enumerate(universe.trajectory):
+        for output_frame_index, frame_idx in enumerate(selected_frame_indices):
+            universe.trajectory[frame_idx]
             atoms = universe.atoms
             
             # --- Write Header ---
@@ -301,6 +316,13 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
     If a trajectory_path is provided, it's loaded with the structure.
     """
     print(f"--- Parsing {filepath.name} with MDAnalysis (Inference Mode) ---")
+    progress_callback: Optional[Callable[[float, str], None]] = getattr(
+        parse_structure_file_mdanalysis,
+        "_progress_callback",
+        None,
+    )
+    if progress_callback:
+        progress_callback(0.05, f"Opening {filepath.name}")
     if trajectory_path:
         print(f"--- Loading trajectory from {trajectory_path.name} ---")
     
@@ -318,7 +340,10 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
     if filepath.suffix.lower() == ".xyz":
         xyz_lattices = parse_xyz_lattice_matrices(filepath)
     # Process each frame (timestep) in the file
+    total_frames = max(len(universe.trajectory), 1)
     for ts_idx, ts in enumerate(universe.trajectory):
+        if progress_callback:
+            progress_callback(0.10 + 0.70 * (ts_idx / total_frames), f"Parsing frame {ts_idx + 1} of {total_frames}")
         try:
             atoms = universe.atoms
             num_atoms = len(atoms)
@@ -356,6 +381,8 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
             atom_types = np.zeros(num_atoms, dtype=np.int64)
             atom_rows = np.zeros(num_atoms, dtype=np.int8)
             atom_cols = np.zeros(num_atoms, dtype=np.int8)
+            atom_labels = np.empty(num_atoms, dtype="<U64")
+            is_xyz = filepath.suffix.lower() == ".xyz"
 
             # Try to get element symbols (best)
             try:
@@ -373,6 +400,7 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
                     row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
                     atom_rows[i] = row
                     atom_cols[i] = col
+                    atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
                     
             except (NoDataError, AttributeError, ValueError):
                 # Fallback to atom names (less reliable)
@@ -398,10 +426,12 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
                     row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
                     atom_rows[i] = row
                     atom_cols[i] = col
+                    atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
 
             mol_dict['atom_types'] = atom_types
             mol_dict['atom_rows'] = atom_rows
             mol_dict['atom_cols'] = atom_cols
+            mol_dict['atom_labels'] = atom_labels
             
             molecules_data.append(mol_dict)
 
@@ -409,6 +439,8 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
             print(f"Error processing frame {ts.frame}: {e}")
             
     print(f"Successfully parsed {len(molecules_data)} frames/molecules.")
+    if progress_callback:
+        progress_callback(0.85, f"Parsed {len(molecules_data)} frame(s)")
     # DIAGNOSTIC: Check extracted atomic numbers
     unique_types = np.unique(np.concatenate([mol['atom_types'] for mol in molecules_data]))
     print(f"Extracted unique atomic numbers (indices): {unique_types}")
@@ -809,7 +841,7 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
     atom_level_keys = set()
     graph_level_keys = set()
 
-    expected_atom_keys = {'pos', 'node_types', 'atom_rows', 'atom_cols',
+    expected_atom_keys = {'pos', 'node_types', 'atom_rows', 'atom_cols', 'atom_labels',
                           'cs_iso', 'cs_tensor', 'cs_tensor_spherical_std', 'cs_iso_std'}
 
     for key in all_keys:
@@ -850,7 +882,10 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
             shape = (total_mols, max_n_atoms)
 
         masked_array = np.ma.masked_all(shape, dtype=first_mol_prop.dtype)
-        masked_array.data[...] = 0 
+        if np.issubdtype(first_mol_prop.dtype, np.number) or first_mol_prop.dtype == bool:
+            masked_array.data[...] = 0
+        else:
+            masked_array.data[...] = ""
 
         for i, mol_data in enumerate(molecules):
             if key in mol_data:
@@ -915,6 +950,10 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output_path, **save_dict)
+    try:
+        output_path.chmod(0o644)
+    except OSError:
+        pass
     print(f"\n✅ Dataset saved successfully to: {output_path}")
     print(f"Saved fields: {list(save_dict.keys())}")
 
@@ -926,6 +965,7 @@ def process_uploaded_file(
     output_dir: Path,
     trajectory_path: Path = None,
     metadata_statistics: Optional[Dict[str, np.ndarray]] = None,
+    progress_callback: Optional[Callable[[float, str], None]] = None,
 ):
     """
     Main function to process an uploaded file, route to the correct parser,
@@ -941,7 +981,13 @@ def process_uploaded_file(
 
     if file_extension in [".pdb", ".gro", ".xyz"]:
         # Full processing for XYZ files (with ground truth)
-        all_molecules_data = parse_structure_file_mdanalysis(input_path, trajectory_path)
+        if progress_callback:
+            progress_callback(0.03, "Starting structure parser")
+        parse_structure_file_mdanalysis._progress_callback = progress_callback
+        try:
+            all_molecules_data = parse_structure_file_mdanalysis(input_path, trajectory_path)
+        finally:
+            parse_structure_file_mdanalysis._progress_callback = None
         if not all_molecules_data:
             raise ValueError(f"Failed to parse any molecules from {file_extension.upper()} file.")
         
@@ -957,6 +1003,10 @@ def process_uploaded_file(
         raise ValueError(f"Unsupported file type: {file_extension}. Please upload .xyz, .pdb, or .gro")
 
     # Save whatever was processed
+    if progress_callback:
+        progress_callback(0.90, "Writing prepared NPZ dataset")
     create_and_save_masked_npz(all_molecules_data, output_path, statistics)
+    if progress_callback:
+        progress_callback(1.0, "Prepared input is ready")
     
     return output_path, len(all_molecules_data)
