@@ -11,6 +11,7 @@ services:
       sh -c "uvicorn backend.app.main:app --reload --workers 1 --host 0.0.0.0 --port 8000"
     volumes:
       - .:/workspaces/GEqNMR
+      - ${GEQNMR_DATA_ROOT:-./outputs}:${GEQNMR_DATA_ROOT:-/workspaces/GEqNMR/outputs}
     ports:
       - "127.0.0.1:8000:8000"
     # Set the working directory to the project root.

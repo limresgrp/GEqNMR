@@ -4,11 +4,74 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_DATA_ROOT="${ROOT_DIR}/outputs"
 API_URL="${GEQNMR_API_URL:-http://localhost:8000}"
-DATA_ROOT="${GEQNMR_DATA_ROOT:-${DEFAULT_DATA_ROOT}}"
+ENV_FILE="${ROOT_DIR}/.env"
 
-mkdir -p "${DATA_ROOT}/prepared_inputs"
-chmod 755 "${DATA_ROOT}" "${DATA_ROOT}/prepared_inputs" 2>/dev/null || true
-export GEQNMR_DATA_ROOT="${DATA_ROOT}"
+read_env_value() {
+  local key="$1"
+  if [ ! -f "$ENV_FILE" ]; then
+    return 1
+  fi
+  python - "$ENV_FILE" "$key" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+for raw in path.read_text().splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    name, value = line.split("=", 1)
+    if name.strip() != key:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    print(value)
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+SAVED_DATA_ROOT="$(read_env_value GEQNMR_DATA_ROOT || true)"
+DATA_ROOT="${GEQNMR_DATA_ROOT:-${SAVED_DATA_ROOT:-${DEFAULT_DATA_ROOT}}}"
+
+ensure_data_root() {
+  mkdir -p "${DATA_ROOT}/prepared_inputs"
+  chmod 755 "${DATA_ROOT}" "${DATA_ROOT}/prepared_inputs" 2>/dev/null || true
+  export GEQNMR_DATA_ROOT="${DATA_ROOT}"
+}
+
+write_env_value() {
+  local key="$1"
+  local value="$2"
+  python - "$ENV_FILE" "$key" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+lines = path.read_text().splitlines() if path.exists() else []
+updated = False
+next_lines = []
+for line in lines:
+    stripped = line.strip()
+    if stripped and not stripped.startswith("#") and "=" in line:
+        name = line.split("=", 1)[0].strip()
+        if name == key:
+            next_lines.append(f"{key}={value}")
+            updated = True
+            continue
+    next_lines.append(line)
+if not updated:
+    next_lines.append(f"{key}={value}")
+path.write_text("\n".join(next_lines) + "\n")
+PY
+  chmod 644 "$ENV_FILE" 2>/dev/null || true
+}
+
+ensure_data_root
 
 prompt() {
   local label="$1"
@@ -28,6 +91,29 @@ api_get() {
 
 api_delete() {
   curl -fsS -X DELETE "$API_URL/$1"
+}
+
+change_root() {
+  local next_root
+  next_root="$(prompt "Shared data root" "$DATA_ROOT")"
+  if [ -z "$next_root" ]; then
+    return
+  fi
+  next_root="$(
+    python - "$next_root" <<'PY'
+from pathlib import Path
+import sys
+
+print(Path(sys.argv[1]).expanduser().resolve())
+PY
+  )"
+  DATA_ROOT="$next_root"
+  ensure_data_root
+  write_env_value GEQNMR_DATA_ROOT "$DATA_ROOT"
+  echo "Console root set to: ${DATA_ROOT}"
+  echo "Saved to: ${ENV_FILE}"
+  echo "Restart the web backend to apply it:"
+  echo "  docker compose up -d backend"
 }
 
 choose_from_json_list() {
@@ -194,6 +280,7 @@ while true; do
   echo "3) Run inference"
   echo "4) Delete prepared input"
   echo "5) List results"
+  echo "6) Change root"
   echo "q) Quit"
   read -r -p "Action: " action
   case "$action" in
@@ -202,6 +289,7 @@ while true; do
     3) run_inference ;;
     4) delete_prepared ;;
     5) list_results ;;
+    6) change_root ;;
     q|Q|"") exit 0 ;;
     *) echo "Unknown action." ;;
   esac
