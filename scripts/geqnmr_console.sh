@@ -183,7 +183,7 @@ PY
 }
 
 add_prepared() {
-  local file traj name response job status
+  local file traj name num_workers response job status
   file="$(prompt "Input file path" "")"
   if [ ! -f "$file" ]; then
     echo "File not found: $file"
@@ -195,11 +195,12 @@ add_prepared() {
     return
   fi
   name="$(prompt "Stored input name" "$(basename "$file")")"
+  num_workers="$(prompt "Input processing workers" "8")"
 
   if [ -n "$traj" ]; then
-    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "trajectory_file=@${traj}" -F "name=${name}")"
+    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "trajectory_file=@${traj}" -F "name=${name}" -F "num_workers=${num_workers}")"
   else
-    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "name=${name}")"
+    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "name=${name}" -F "num_workers=${num_workers}")"
   fi
   job="$(JSON_PAYLOAD="$response" python - <<'PY'
 import json, os
@@ -239,7 +240,7 @@ delete_prepared() {
 }
 
 run_inference() {
-  local prepared_json prepared_rows prepared_id models_json model_rows model_name destd frame_slice response
+  local prepared_json prepared_rows prepared_id models_json model_rows model_name destd frame_slice device batch_size response
   prepared_json="$(api_get prepared)"
   prepared_rows="$(choose_from_json_list "$prepared_json" prepared)"
   prepared_id="$(select_row_id "$prepared_rows" "Prepared input number")" || return
@@ -255,11 +256,13 @@ PY
   model_name="$(select_row_id "$model_rows" "Model number")" || return
   destd="$(prompt "De-standardize predictions (true/false)" "true")"
   frame_slice="$(prompt "Frame slice start:stop:step (blank = all)" "")"
+  device="$(prompt "Inference device" "cuda")"
+  batch_size="$(prompt "Inference batch size" "1")"
 
   if [ -n "$frame_slice" ]; then
-    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}" -F "frame_slice=${frame_slice}")"
+    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}" -F "frame_slice=${frame_slice}" -F "device=${device}" -F "batch_size=${batch_size}")"
   else
-    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}")"
+    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}" -F "device=${device}" -F "batch_size=${batch_size}")"
   fi
   JSON_PAYLOAD="$response" python - <<'PY'
 import json, os

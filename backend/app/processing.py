@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import shlex
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import torch
 from e3nn.o3 import Irreps
@@ -309,7 +310,111 @@ def parse_xyz_lattice_matrices(filepath: Path):
     return matrices
 
 # --- Existing Function: MDAnalysis Parser (for PDB/GRO) ---
-def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None):
+def _extract_mdanalysis_frame(filepath: Path, atoms, ts, frame_index: int, xyz_lattices: List[Optional[np.ndarray]]):
+    num_atoms = len(atoms)
+    if num_atoms == 0:
+        return None
+
+    mol_dict = {'num_atoms': num_atoms}
+
+    # Get positions
+    mol_dict['pos'] = atoms.positions.astype(np.float32)
+
+    lattice_from_header = None
+    if xyz_lattices and frame_index < len(xyz_lattices):
+        lattice_from_header = xyz_lattices[frame_index]
+
+    pbc_present = lattice_from_header is not None
+    pbc_detected = False
+    if ts.dimensions is not None and not np.allclose(ts.dimensions, 0.0):
+        box_matrix = mdamath.triclinic_vectors(ts.dimensions, dtype=np.float32)
+        if np.any(box_matrix):
+            pbc_detected = True
+            if not pbc_present:
+                mol_dict['Lattice'] = box_matrix.reshape(-1)
+
+    if filepath.suffix.lower() != ".xyz":
+        pbc_present = pbc_detected
+
+    if pbc_present and lattice_from_header is not None:
+        mol_dict['Lattice'] = lattice_from_header
+
+    mol_dict['pbc_present'] = np.array(pbc_present, dtype=bool)
+    mol_dict['pbc_detected'] = np.array(pbc_detected, dtype=bool)
+
+    # Get atom types (Atomic Numbers)
+    atom_types = np.zeros(num_atoms, dtype=np.int64)
+    atom_rows = np.zeros(num_atoms, dtype=np.int8)
+    atom_cols = np.zeros(num_atoms, dtype=np.int8)
+    atom_labels = np.empty(num_atoms, dtype="<U64")
+    is_xyz = filepath.suffix.lower() == ".xyz"
+
+    # Try to get element symbols (best)
+    try:
+        # Use elements attribute directly if available and reliable
+        elements = atoms.elements
+
+        for i, el in enumerate(elements):
+            symbol = str(el).capitalize() # Ensure compatibility with ATOMIC_NUMBERS keys
+
+            # Store atomic number (e.g., C=6, O=8, Ca=20)
+            atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
+            atom_types[i] = atomic_num
+
+            # Look up row/col
+            row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
+            atom_rows[i] = row
+            atom_cols[i] = col
+            atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
+
+    except (NoDataError, AttributeError, ValueError):
+        # Fallback to atom names (less reliable)
+        print("Warning: 'elements' not found. Falling back to 'names' for atom types.")
+        atom_names = atoms.names
+        two_letter_symbols = [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 2]
+        one_letter_symbols = [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 1]
+        for i, name in enumerate(atom_names):
+            # Robust symbol extraction: try 2-letter elements first, then 1-letter, ignore digits
+            symbol_upper = ''.join(filter(str.isalpha, name)).upper()
+            symbol = 'X' # Default unknown
+
+            if len(symbol_upper) >= 2 and symbol_upper[:2] in two_letter_symbols:
+                # e.g., 'CLA' -> 'CL' -> 'Cl' (atomic number 17)
+                symbol = symbol_upper[:2].capitalize()
+            elif len(symbol_upper) >= 1 and symbol_upper[0] in one_letter_symbols:
+                # e.g., 'C1' -> 'C'
+                symbol = symbol_upper[0].capitalize()
+
+            # Store atomic number (e.g., C=6, O=8, Ca=20)
+            atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
+            atom_types[i] = atomic_num
+
+            # Look up row/col
+            row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
+            atom_rows[i] = row
+            atom_cols[i] = col
+            atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
+
+    mol_dict['atom_types'] = atom_types
+    mol_dict['atom_rows'] = atom_rows
+    mol_dict['atom_cols'] = atom_cols
+    mol_dict['atom_labels'] = atom_labels
+    return mol_dict
+
+
+def _parse_mdanalysis_frame_worker(args):
+    filepath_raw, trajectory_path_raw, frame_index, xyz_lattices = args
+    filepath = Path(filepath_raw)
+    trajectory_path = Path(trajectory_path_raw) if trajectory_path_raw else None
+    if trajectory_path:
+        universe = mda.Universe(str(filepath), str(trajectory_path))
+    else:
+        universe = mda.Universe(str(filepath))
+    ts = universe.trajectory[frame_index]
+    return frame_index, _extract_mdanalysis_frame(filepath, universe.atoms, ts, frame_index, xyz_lattices)
+
+
+def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None, num_workers: int = 1):
     """
     Parses PDB or GRO files using MDAnalysis for inference.
     Only extracts positions and atom types (atomic numbers).
@@ -339,104 +444,46 @@ def parse_structure_file_mdanalysis(filepath: Path, trajectory_path: Path = None
     xyz_lattices = []
     if filepath.suffix.lower() == ".xyz":
         xyz_lattices = parse_xyz_lattice_matrices(filepath)
-    # Process each frame (timestep) in the file
     total_frames = max(len(universe.trajectory), 1)
-    for ts_idx, ts in enumerate(universe.trajectory):
-        if progress_callback:
-            progress_callback(0.10 + 0.70 * (ts_idx / total_frames), f"Parsing frame {ts_idx + 1} of {total_frames}")
-        try:
-            atoms = universe.atoms
-            num_atoms = len(atoms)
-            if num_atoms == 0:
-                continue
-
-            mol_dict = {'num_atoms': num_atoms}
-
-            # Get positions
-            mol_dict['pos'] = atoms.positions.astype(np.float32)
-
-            lattice_from_header = None
-            if xyz_lattices and ts_idx < len(xyz_lattices):
-                lattice_from_header = xyz_lattices[ts_idx]
-
-            pbc_present = lattice_from_header is not None
-            pbc_detected = False
-            if ts.dimensions is not None and not np.allclose(ts.dimensions, 0.0):
-                box_matrix = mdamath.triclinic_vectors(ts.dimensions, dtype=np.float32)
-                if np.any(box_matrix):
-                    pbc_detected = True
-                    if not pbc_present:
-                        mol_dict['Lattice'] = box_matrix.reshape(-1)
-
-            if filepath.suffix.lower() != ".xyz":
-                pbc_present = pbc_detected
-
-            if pbc_present and lattice_from_header is not None:
-                mol_dict['Lattice'] = lattice_from_header
-
-            mol_dict['pbc_present'] = np.array(pbc_present, dtype=bool)
-            mol_dict['pbc_detected'] = np.array(pbc_detected, dtype=bool)
-
-            # Get atom types (Atomic Numbers)
-            atom_types = np.zeros(num_atoms, dtype=np.int64)
-            atom_rows = np.zeros(num_atoms, dtype=np.int8)
-            atom_cols = np.zeros(num_atoms, dtype=np.int8)
-            atom_labels = np.empty(num_atoms, dtype="<U64")
-            is_xyz = filepath.suffix.lower() == ".xyz"
-
-            # Try to get element symbols (best)
+    if num_workers > 1 and total_frames > 1:
+        print(f"Parsing {total_frames} frames with {num_workers} worker processes.")
+        frame_results = {}
+        worker_args = [
+            (str(filepath), str(trajectory_path) if trajectory_path else None, frame_index, xyz_lattices)
+            for frame_index in range(total_frames)
+        ]
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_frame = {
+                executor.submit(_parse_mdanalysis_frame_worker, args): args[2]
+                for args in worker_args
+            }
+            completed = 0
+            for future in as_completed(future_to_frame):
+                frame_index = future_to_frame[future]
+                completed += 1
+                if progress_callback:
+                    progress_callback(
+                        0.10 + 0.70 * (completed / total_frames),
+                        f"Parsed frame {completed} of {total_frames}",
+                    )
+                try:
+                    _frame_index, mol_dict = future.result()
+                    if mol_dict is not None:
+                        frame_results[_frame_index] = mol_dict
+                except Exception as e:
+                    print(f"Error processing frame {frame_index}: {e}")
+        molecules_data = [frame_results[idx] for idx in sorted(frame_results)]
+    else:
+        # Process each frame (timestep) in the file
+        for ts_idx, ts in enumerate(universe.trajectory):
+            if progress_callback:
+                progress_callback(0.10 + 0.70 * (ts_idx / total_frames), f"Parsing frame {ts_idx + 1} of {total_frames}")
             try:
-                # Use elements attribute directly if available and reliable
-                elements = atoms.elements
-                
-                for i, el in enumerate(elements):
-                    symbol = str(el).capitalize() # Ensure compatibility with ATOMIC_NUMBERS keys
-                    
-                    # Store atomic number (e.g., C=6, O=8, Ca=20)
-                    atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
-                    atom_types[i] = atomic_num
-                    
-                    # Look up row/col
-                    row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
-                    atom_rows[i] = row
-                    atom_cols[i] = col
-                    atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
-                    
-            except (NoDataError, AttributeError, ValueError):
-                # Fallback to atom names (less reliable)
-                print("Warning: 'elements' not found. Falling back to 'names' for atom types.")
-                atom_names = atoms.names
-                for i, name in enumerate(atom_names):
-                    # Robust symbol extraction: try 2-letter elements first, then 1-letter, ignore digits
-                    symbol_upper = ''.join(filter(str.isalpha, name)).upper()
-                    symbol = 'X' # Default unknown
-                    
-                    if len(symbol_upper) >= 2 and symbol_upper[:2] in [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 2]:
-                        # e.g., 'CLA' -> 'CL' -> 'Cl' (atomic number 17)
-                        symbol = symbol_upper[:2].capitalize()
-                    elif len(symbol_upper) >= 1 and symbol_upper[0] in [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 1]:
-                        # e.g., 'C1' -> 'C'
-                        symbol = symbol_upper[0].capitalize()
-                    
-                    # Store atomic number (e.g., C=6, O=8, Ca=20)
-                    atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
-                    atom_types[i] = atomic_num
-                    
-                    # Look up row/col
-                    row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
-                    atom_rows[i] = row
-                    atom_cols[i] = col
-                    atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
-
-            mol_dict['atom_types'] = atom_types
-            mol_dict['atom_rows'] = atom_rows
-            mol_dict['atom_cols'] = atom_cols
-            mol_dict['atom_labels'] = atom_labels
-            
-            molecules_data.append(mol_dict)
-
-        except Exception as e:
-            print(f"Error processing frame {ts.frame}: {e}")
+                mol_dict = _extract_mdanalysis_frame(filepath, universe.atoms, ts, ts_idx, xyz_lattices)
+                if mol_dict is not None:
+                    molecules_data.append(mol_dict)
+            except Exception as e:
+                print(f"Error processing frame {ts.frame}: {e}")
             
     print(f"Successfully parsed {len(molecules_data)} frames/molecules.")
     if progress_callback:
@@ -966,6 +1013,7 @@ def process_uploaded_file(
     trajectory_path: Path = None,
     metadata_statistics: Optional[Dict[str, np.ndarray]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    num_workers: int = 1,
 ):
     """
     Main function to process an uploaded file, route to the correct parser,
@@ -985,7 +1033,7 @@ def process_uploaded_file(
             progress_callback(0.03, "Starting structure parser")
         parse_structure_file_mdanalysis._progress_callback = progress_callback
         try:
-            all_molecules_data = parse_structure_file_mdanalysis(input_path, trajectory_path)
+            all_molecules_data = parse_structure_file_mdanalysis(input_path, trajectory_path, num_workers=max(1, int(num_workers)))
         finally:
             parse_structure_file_mdanalysis._progress_callback = None
         if not all_molecules_data:

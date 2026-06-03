@@ -112,6 +112,8 @@ def _write_prediction_metadata(
     frame_slice: Optional[str] = None,
     frame_indices: Optional[List[int]] = None,
     prepared: Optional[dict] = None,
+    device: Optional[str] = None,
+    batch_size: Optional[int] = None,
 ):
     atom_labels = _load_atom_labels_from_npz(npz_path)
     if not atom_labels:
@@ -143,6 +145,8 @@ def _write_prediction_metadata(
         "frame_slice": frame_slice,
         "frame_indices": frame_indices,
         "prepared": prepared,
+        "device": device,
+        "batch_size": batch_size,
         "num_frames": n_frames,
         "num_atoms": n_atoms,
         "atoms": atoms,
@@ -502,7 +506,7 @@ def _slice_prepared_npz(source_npz: Path, output_dir: Path, frame_indices: Optio
     return sliced_npz
 
 
-def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, input_path: Path, input_filename: str, trajectory_input_path: Optional[Path], trajectory_filename: Optional[str], custom_name: Optional[str]):
+def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, input_path: Path, input_filename: str, trajectory_input_path: Optional[Path], trajectory_filename: Optional[str], custom_name: Optional[str], num_workers: int):
     try:
         def progress(value: float, message: str):
             _set_prepare_job(job_id, "running", value, message)
@@ -513,6 +517,7 @@ def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, inpu
             prepared_dir,
             trajectory_input_path,
             progress_callback=progress,
+            num_workers=num_workers,
         )
         manifest = {
             "id": prepared_id,
@@ -521,6 +526,7 @@ def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, inpu
             "trajectory_file": trajectory_filename,
             "npz_file": npz_output_path.name,
             "num_molecules": num_molecules,
+            "num_workers": num_workers,
             "created": time.time(),
         }
         _write_prepared_manifest(prepared_dir, manifest)
@@ -540,6 +546,7 @@ async def prepare_input(
     file: UploadFile = File(...),
     trajectory_file: UploadFile = File(None),
     name: str = Form(None),
+    num_workers: int = Form(1),
 ):
     file_extension = file.filename.split('.')[-1].lower()
     if file_extension not in ["pdb", "gro", "xyz"]:
@@ -547,6 +554,10 @@ async def prepare_input(
 
     prepared_id = uuid.uuid4().hex
     job_id = uuid.uuid4().hex
+    try:
+        num_workers = max(1, int(num_workers))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="num_workers must be a positive integer.")
     prepared_dir = PREPARED_DIR / prepared_id
     prepared_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -593,6 +604,7 @@ async def prepare_input(
         trajectory_input_path,
         trajectory_filename,
         name.strip() if isinstance(name, str) and name.strip() else None,
+        num_workers,
     )
     return {"job_id": job_id, "prepared_id": prepared_id, "status": "queued"}
 
@@ -708,6 +720,8 @@ async def infer_prepared_input(
     model_name: str = Form(None),
     destandardize: bool = Form(True),
     frame_slice: str = Form(None),
+    device: str = Form(None),
+    batch_size: int = Form(1),
 ):
     prepared_dir = _resolve_prepared_dir(prepared_id)
 
@@ -738,6 +752,8 @@ async def infer_prepared_input(
             prepared_npz_path=npz_path,
             frame_slice=frame_slice,
             prepared_context=_prepared_summary(prepared_dir),
+            device_name=device,
+            batch_size=batch_size,
         )
         return {
             "message": "Inference complete. Structure file with predictions generated.",
@@ -765,6 +781,8 @@ async def run_inference_workflow(
     prepared_npz_path: Path = None,
     frame_slice: Optional[str] = None,
     prepared_context: Optional[dict] = None,
+    device_name: Optional[str] = None,
+    batch_size: int = 1,
 ):
     """
     Orchestrates loading, inference, and file saving for an uploaded structure file.
@@ -772,8 +790,21 @@ async def run_inference_workflow(
     """
     print(f"--- Starting Inference Workflow (De-standardize: {destandardize}) ---")
     
-    # Check if a CUDA device is available and use it
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        batch_size = max(1, int(batch_size))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="batch_size must be a positive integer.")
+
+    # Check if a CUDA device is available and use it unless explicitly overridden.
+    if device_name and str(device_name).strip():
+        try:
+            device = torch.device(str(device_name).strip())
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid device '{device_name}': {e}")
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise HTTPException(status_code=400, detail="CUDA was requested but is not available.")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # 1. Load deployed model and metadata
@@ -813,7 +844,7 @@ async def run_inference_workflow(
         config.update(test_config)
         _disable_dataset_target_requirements(config)
         # Set batch size for inference
-        config['batch_size'] = config.get('batch_size', 1)
+        config['batch_size'] = batch_size
         config["denormalize_inference_outputs"] = bool(destandardize and has_inference_normalization_stats)
         apply_global_config(config.as_dict(), warn_on_override=False)
         print("Configuration loaded and merged.")
@@ -973,6 +1004,8 @@ async def run_inference_workflow(
                 frame_slice=frame_slice,
                 frame_indices=frame_indices,
                 prepared=prepared_context,
+                device=str(device),
+                batch_size=batch_size,
             )
 
             # 6. Cleanup temporary NPZ file
@@ -1023,7 +1056,9 @@ async def infer_pdb_file(
     file: UploadFile = File(...),
     trajectory_file: UploadFile = File(None),
     model_name: str = Form(None),
-    destandardize: bool = Form(True) # Default to True if not provided
+    destandardize: bool = Form(True), # Default to True if not provided
+    device: str = Form(None),
+    batch_size: int = Form(1),
 ):
     """
     Endpoint to upload a PDB/GRO/XYZ file, run inference, and return the path to the modified structure file.
@@ -1077,7 +1112,9 @@ async def infer_pdb_file(
                 output_dir=OUTPUT_DIR,
                 destandardize=destandardize,
                 model_path=model_path,
-                trajectory_path=trajectory_input_path
+                trajectory_path=trajectory_input_path,
+                device_name=device,
+                batch_size=batch_size,
             )
             
             return {
