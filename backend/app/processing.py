@@ -873,7 +873,7 @@ def standardize_data(molecules, statistics, config):
             if field == "cs_tensor_spherical":
                 mol["cs_iso_std"] = values_torch.numpy()[:, 0:1]
 
-def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
+def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict, compress: bool = False):
     """Creates and saves masked/standardized arrays and statistics to NPZ."""
     if not molecules:
         print("No data to save. Aborting.")
@@ -996,7 +996,10 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict):
         save_dict[key] = np.asarray(value)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_path, **save_dict)
+    if compress:
+        np.savez_compressed(output_path, **save_dict)
+    else:
+        np.savez(output_path, **save_dict)
     try:
         output_path.chmod(0o644)
     except OSError:
@@ -1014,6 +1017,7 @@ def process_uploaded_file(
     metadata_statistics: Optional[Dict[str, np.ndarray]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     num_workers: int = 1,
+    compress_output: bool = False,
 ):
     """
     Main function to process an uploaded file, route to the correct parser,
@@ -1053,7 +1057,7 @@ def process_uploaded_file(
     # Save whatever was processed
     if progress_callback:
         progress_callback(0.90, "Writing prepared NPZ dataset")
-    create_and_save_masked_npz(all_molecules_data, output_path, statistics)
+    create_and_save_masked_npz(all_molecules_data, output_path, statistics, compress=compress_output)
     if progress_callback:
         progress_callback(1.0, "Prepared input is ready")
     

@@ -498,7 +498,7 @@ def _slice_prepared_npz(source_npz: Path, output_dir: Path, frame_indices: Optio
                 save_dict[key] = value[frame_indices]
             else:
                 save_dict[key] = value
-    np.savez_compressed(sliced_npz, **save_dict)
+    np.savez(sliced_npz, **save_dict)
     try:
         sliced_npz.chmod(0o644)
     except OSError:
@@ -703,7 +703,7 @@ def set_prepared_lattice(
         save_dict: dict = {key: data[key] for key in data.files}
 
     save_dict["Lattice"] = np.tile(lattice_matrix, (num_molecules, 1, 1))
-    np.savez_compressed(npz_path, **save_dict)
+    np.savez(npz_path, **save_dict)
 
     manifest["lattice_override"] = True
     _write_prepared_manifest(prepared_dir, manifest)

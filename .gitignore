@@ -1,6 +1,7 @@
 train_session/
 uploads/
 outputs/
+models/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

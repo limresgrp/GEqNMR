@@ -85,12 +85,8 @@ prompt() {
   fi
 }
 
-api_get() {
-  curl -fsS "$API_URL/$1"
-}
-
-api_delete() {
-  curl -fsS -X DELETE "$API_URL/$1"
+run_cli() {
+  python -m backend.app.cli "$@"
 }
 
 change_root() {
@@ -158,7 +154,7 @@ select_row_id() {
 
 list_prepared() {
   local json rows
-  json="$(api_get prepared)"
+  json="$(run_cli list-prepared)"
   rows="$(choose_from_json_list "$json" prepared)"
   echo "Prepared inputs:"
   print_rows "$rows"
@@ -166,7 +162,7 @@ list_prepared() {
 
 list_results() {
   local json
-  json="$(api_get results)"
+  json="$(run_cli list-results)"
   JSON_PAYLOAD="$json" python - <<'PY'
 import json, datetime, os
 data = json.loads(os.environ["JSON_PAYLOAD"])
@@ -183,7 +179,8 @@ PY
 }
 
 add_prepared() {
-  local file traj name num_workers response job status
+  local file traj name num_workers
+  local -a command
   file="$(prompt "Input file path" "")"
   if [ ! -f "$file" ]; then
     echo "File not found: $file"
@@ -197,55 +194,30 @@ add_prepared() {
   name="$(prompt "Stored input name" "$(basename "$file")")"
   num_workers="$(prompt "Input processing workers" "8")"
 
+  command=(prepare --input "$file" --name "$name" --workers "$num_workers")
   if [ -n "$traj" ]; then
-    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "trajectory_file=@${traj}" -F "name=${name}" -F "num_workers=${num_workers}")"
-  else
-    response="$(curl -fsS -X POST "$API_URL/prepare" -F "file=@${file}" -F "name=${name}" -F "num_workers=${num_workers}")"
+    command+=(--trajectory "$traj")
   fi
-  job="$(JSON_PAYLOAD="$response" python - <<'PY'
-import json, os
-print(json.loads(os.environ["JSON_PAYLOAD"])["job_id"])
-PY
-)"
-  echo "Prepare job: $job"
-  while true; do
-    status="$(api_get "prepare/jobs/${job}")"
-    JSON_PAYLOAD="$status" python - <<'PY'
-import json, os
-data = json.loads(os.environ["JSON_PAYLOAD"])
-print(f"  {data.get('status')} {int(float(data.get('progress', 0))*100)}% - {data.get('message', '')}")
-PY
-    state="$(JSON_PAYLOAD="$status" python - <<'PY'
-import json, os
-print(json.loads(os.environ["JSON_PAYLOAD"]).get("status", ""))
-PY
-)"
-    if [ "$state" = "completed" ]; then
-      break
-    fi
-    if [ "$state" = "failed" ]; then
-      return 1
-    fi
-    sleep 1
-  done
+  run_cli "${command[@]}"
 }
 
 delete_prepared() {
   local json rows id
-  json="$(api_get prepared)"
+  json="$(run_cli list-prepared)"
   rows="$(choose_from_json_list "$json" prepared)"
   id="$(select_row_id "$rows" "Delete prepared input number")" || return
-  api_delete "prepared/${id}" >/dev/null
+  run_cli delete-prepared "$id" >/dev/null
   echo "Deleted: $id"
 }
 
 run_inference() {
-  local prepared_json prepared_rows prepared_id models_json model_rows model_name destd frame_slice device batch_size response
-  prepared_json="$(api_get prepared)"
+  local prepared_json prepared_rows prepared_id models_json model_rows model_name destd frame_slice device batch_size
+  local -a command
+  prepared_json="$(run_cli list-prepared)"
   prepared_rows="$(choose_from_json_list "$prepared_json" prepared)"
   prepared_id="$(select_row_id "$prepared_rows" "Prepared input number")" || return
 
-  models_json="$(api_get models)"
+  models_json="$(run_cli list-models)"
   model_rows="$(JSON_PAYLOAD="$models_json" python - <<'PY'
 import json, os
 models = json.loads(os.environ["JSON_PAYLOAD"]).get("models", [])
@@ -259,24 +231,21 @@ PY
   device="$(prompt "Inference device" "cuda")"
   batch_size="$(prompt "Inference batch size" "1")"
 
-  if [ -n "$frame_slice" ]; then
-    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}" -F "frame_slice=${frame_slice}" -F "device=${device}" -F "batch_size=${batch_size}")"
+  command=(infer-prepared "$prepared_id" --model "$model_name" --device "$device" --batch-size "$batch_size")
+  if [ "$destd" = "true" ] || [ "$destd" = "True" ] || [ "$destd" = "1" ]; then
+    command+=(--destandardize)
   else
-    response="$(curl -fsS -X POST "$API_URL/infer/prepared/${prepared_id}" -F "model_name=${model_name}" -F "destandardize=${destd}" -F "device=${device}" -F "batch_size=${batch_size}")"
+    command+=(--no-destandardize)
   fi
-  JSON_PAYLOAD="$response" python - <<'PY'
-import json, os
-data = json.loads(os.environ["JSON_PAYLOAD"])
-print("Inference complete")
-print(f"  output: {data.get('output_file')}")
-print(f"  atoms:  {data.get('atoms_predicted')}")
-PY
+  if [ -n "$frame_slice" ]; then
+    command+=(--frame-slice "$frame_slice")
+  fi
+  run_cli "${command[@]}"
 }
 
 while true; do
   echo ""
   echo "GEqNMR console"
-  echo "API:  ${API_URL}"
   echo "Root: ${DATA_ROOT}"
   echo "1) List prepared inputs"
   echo "2) Add prepared input"
