@@ -114,6 +114,7 @@ def _write_prediction_metadata(
     prepared: Optional[dict] = None,
     device: Optional[str] = None,
     batch_size: Optional[int] = None,
+    normalization_source: Optional[str] = None,
 ):
     atom_labels = _load_atom_labels_from_npz(npz_path)
     if not atom_labels:
@@ -147,6 +148,7 @@ def _write_prediction_metadata(
         "prepared": prepared,
         "device": device,
         "batch_size": batch_size,
+        "normalization_source": normalization_source,
         "num_frames": n_frames,
         "num_atoms": n_atoms,
         "atoms": atoms,
@@ -829,6 +831,13 @@ async def run_inference_workflow(
     has_inference_normalization_stats = bool(
         inference_metadata.get("normalization_stats_by_ensemble")
     )
+    normalization_source = "none"
+    if has_inference_normalization_stats:
+        normalization_source = "deployed_model_inference_metadata_v1"
+        print("Using normalization statistics from deployed model inference_metadata_v1.")
+    elif metadata_stats:
+        normalization_source = "deployed_model_legacy_flat_metadata"
+        print("Using normalization statistics from deployed model legacy flat metadata.")
 
     # 2. Load metadata config and merge template overrides
     try:
@@ -897,7 +906,7 @@ async def run_inference_workflow(
                 if mean_per_type.numel() > 0 and torch.allclose(mean_per_type, mean_per_type[0]):
                     print("\nWARNING: Loaded mean statistics are uniform across all element types.")
                     print("This indicates that the de-standardization is currently using a single, non-element-specific mean/std.")
-                    print("To fix this, ensure your 'template.npz' contains valid, non-uniform, per-type statistics from the training set.")
+                    print("To fix this, ensure the deployed model metadata contains valid, non-uniform, per-type statistics from the training set.")
                     print("Current mean shape:", mean_per_type.shape)
                 # --- End Diagnostic Check ---
                 
@@ -1006,6 +1015,7 @@ async def run_inference_workflow(
                 prepared=prepared_context,
                 device=str(device),
                 batch_size=batch_size,
+                normalization_source=normalization_source,
             )
 
             # 6. Cleanup temporary NPZ file

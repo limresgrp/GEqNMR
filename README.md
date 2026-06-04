@@ -1,4 +1,60 @@
-# 🃏 Browser Card Game – Full Setup Guide
+# GEqNMR
+
+GEqNMR prepares molecular structures/trajectories, runs GEqTrain deployed models for chemical-shift inference, and stores prepared inputs/results under a shared data root.
+
+## Deploying GEqTrain Models for GEqNMR
+
+GEqNMR expects TorchScript GEqTrain deployment files (`.pth`) in the models directory configured by `GEQNMR_MODELS_DIR` or, by default:
+
+```bash
+/home/angiod@usi.ch/GEqNMR/models
+```
+
+Deploy models with GEqTrain’s deploy script and embed normalization statistics in the deployed model metadata. This lets GEqNMR denormalize predictions using metadata from the model itself, without loading the training dataset during inference.
+
+For the ShiftML3 production model:
+
+```bash
+cd /home/angiod@usi.ch/GEqTrain
+
+python -m geqtrain.scripts.deploy \
+  --model /scratch/angiod/GEqTrain/results/shiftml3/__prod__iso__ft__pt2__/last_model.pth \
+  --out-file /home/angiod@usi.ch/GEqNMR/models/shiftml3_prod_iso_ft_pt2_deployed.pth \
+  --normalization-stats-npz /home/angiod@usi.ch/ShiftML3/train_prod_iso.npz
+```
+
+The `--normalization-stats-npz` file must be a processed training NPZ containing the normalization keys required by the model config, for example:
+
+```text
+_mean_.per_type.cs_iso
+_std_.per_type.cs_iso
+_transform_.cs_iso.lambda   # when using a fitted transform such as Yeo-Johnson
+```
+
+GEqNMR reads the deployed model metadata key `inference_metadata_v1` at inference time. If present, this metadata is preferred over legacy flat metadata keys. Inference result metadata records the source as:
+
+```json
+"normalization_source": "deployed_model_inference_metadata_v1"
+```
+
+You can verify a deployed model contains normalization metadata with:
+
+```bash
+cd /home/angiod@usi.ch/GEqNMR
+python - <<'PY'
+from pathlib import Path
+from geqtrain.utils.deploy import load_deployed_model
+from geqtrain.utils.inference_metadata import INFERENCE_METADATA_KEY, load_inference_metadata_bundle
+
+model = Path("models/shiftml3_prod_iso_ft_pt2_deployed.pth")
+_, metadata = load_deployed_model(model, device="cpu")
+bundle = load_inference_metadata_bundle(metadata.get(INFERENCE_METADATA_KEY, ""))
+print(bundle.get("normalization", {}))
+print(bundle.get("normalization_stats_by_ensemble", {}).keys())
+PY
+```
+
+## Legacy Setup Notes
 
 Welcome to the **Browser Card Game** project!  
 This guide covers everything you need to **develop, test, and deploy** the application, from a zero setup to a working system — both locally and remotely.

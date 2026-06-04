@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEFAULT_DATA_ROOT="${ROOT_DIR}/outputs"
-API_URL="${GEQNMR_API_URL:-http://localhost:8000}"
 ENV_FILE="${ROOT_DIR}/.env"
+DEFAULT_PYTHON="${ROOT_DIR}/.venv-geqnmr/bin/python"
 
 read_env_value() {
   local key="$1"
@@ -86,7 +86,11 @@ prompt() {
 }
 
 run_cli() {
-  python -m backend.app.cli "$@"
+  local python_bin="${GEQNMR_PYTHON:-python}"
+  if [ -z "${GEQNMR_PYTHON:-}" ] && [ -x "$DEFAULT_PYTHON" ]; then
+    python_bin="$DEFAULT_PYTHON"
+  fi
+  "$python_bin" -m backend.app.cli "$@"
 }
 
 change_root() {
@@ -141,14 +145,19 @@ print_rows() {
 }
 
 select_row_id() {
-  local rows="$1"
-  local label="$2"
+  local label="$1"
+  local rows="$2"
   if [ -z "$rows" ]; then
     return 1
   fi
-  print_rows "$rows"
+  echo "$label:" >&2
+  print_rows "$rows" >&2
   local choice
-  choice="$(prompt "$label" "1")"
+  printf "Choice [1]: " >&2
+  read -r choice
+  if [ -z "$choice" ]; then
+    choice="1"
+  fi
   awk -F'|' -v choice="$choice" '$1 == choice {print $2; found=1} END {exit found ? 0 : 1}' <<< "$rows"
 }
 
@@ -205,7 +214,10 @@ delete_prepared() {
   local json rows id
   json="$(run_cli list-prepared)"
   rows="$(choose_from_json_list "$json" prepared)"
-  id="$(select_row_id "$rows" "Delete prepared input number")" || return
+  if ! id="$(select_row_id "Delete prepared input number" "$rows")"; then
+    echo "Invalid selection."
+    return
+  fi
   run_cli delete-prepared "$id" >/dev/null
   echo "Deleted: $id"
 }
@@ -215,7 +227,10 @@ run_inference() {
   local -a command
   prepared_json="$(run_cli list-prepared)"
   prepared_rows="$(choose_from_json_list "$prepared_json" prepared)"
-  prepared_id="$(select_row_id "$prepared_rows" "Prepared input number")" || return
+  if ! prepared_id="$(select_row_id "Prepared input number" "$prepared_rows")"; then
+    echo "Invalid selection."
+    return
+  fi
 
   models_json="$(run_cli list-models)"
   model_rows="$(JSON_PAYLOAD="$models_json" python - <<'PY'
@@ -225,7 +240,10 @@ for idx, model in enumerate(models, 1):
     print(f"{idx}|{model}|{model}|")
 PY
 )"
-  model_name="$(select_row_id "$model_rows" "Model number")" || return
+  if ! model_name="$(select_row_id "Model number" "$model_rows")"; then
+    echo "Invalid selection."
+    return
+  fi
   destd="$(prompt "De-standardize predictions (true/false)" "true")"
   frame_slice="$(prompt "Frame slice start:stop:step (blank = all)" "")"
   device="$(prompt "Inference device" "cuda")"
@@ -240,7 +258,10 @@ PY
   if [ -n "$frame_slice" ]; then
     command+=(--frame-slice "$frame_slice")
   fi
-  run_cli "${command[@]}"
+  if ! run_cli "${command[@]}"; then
+    echo "Inference failed."
+    return
+  fi
 }
 
 while true; do

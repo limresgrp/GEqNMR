@@ -201,21 +201,21 @@ def cmd_prepare(args):
 async def _infer_prepared(args):
     from . import main
 
-    prepared_dir = main._resolve_prepared_dir(args.prepared_id)
-    manifest = main._load_prepared_manifest(prepared_dir)
+    prepared_dir = _resolve_prepared_dir(args.prepared_id)
+    manifest = _load_prepared_manifest(prepared_dir)
     input_path = prepared_dir / manifest["input_file"]
     npz_path = prepared_dir / manifest["npz_file"]
     trajectory_path = prepared_dir / manifest["trajectory_file"] if manifest.get("trajectory_file") else None
     model_path = main.resolve_model_path(args.model) if args.model else main.get_default_model_path()
     output_path, atoms_predicted = await main.run_inference_workflow(
         input_path=input_path,
-        output_dir=main.OUTPUT_DIR,
+        output_dir=OUTPUT_DIR,
         destandardize=args.destandardize,
         model_path=model_path,
         trajectory_path=trajectory_path,
         prepared_npz_path=npz_path,
         frame_slice=args.frame_slice,
-        prepared_context=main._prepared_summary(prepared_dir),
+        prepared_context=_prepared_summary(prepared_dir),
         device_name=args.device,
         batch_size=args.batch_size,
     )
@@ -230,7 +230,13 @@ async def _infer_prepared(args):
 
 
 def cmd_infer_prepared(args):
-    asyncio.run(_infer_prepared(args))
+    try:
+        asyncio.run(_infer_prepared(args))
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        if detail:
+            raise SystemExit(f"Error: {detail}") from exc
+        raise
 
 
 def build_parser():

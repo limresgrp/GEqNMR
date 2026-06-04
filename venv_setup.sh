@@ -25,6 +25,7 @@ fi
 
 PY_VER="$(prompt "Python version" "${DEFAULT_PY}")"
 VENV_DIR="$(prompt "Virtual env directory" "${DEFAULT_ENV}")"
+UV_PYTHON="cpython-${PY_VER}"
 
 if [ -d "${VENV_DIR}" ]; then
   read -r -p "Remove existing environment at ${VENV_DIR}? [y/N]: " remove_env
@@ -34,10 +35,8 @@ if [ -d "${VENV_DIR}" ]; then
 fi
 
 if [ ! -d "${VENV_DIR}" ]; then
-  if ! uv venv "${VENV_DIR}" --python "${PY_VER}" --seed; then
-    uv python install "${PY_VER}"
-    uv venv "${VENV_DIR}" --python "${PY_VER}" --seed
-  fi
+  uv python install "${UV_PYTHON}"
+  uv venv "${VENV_DIR}" --python "${UV_PYTHON}" --seed
 fi
 
 source "${VENV_DIR}/bin/activate"

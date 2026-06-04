@@ -42,13 +42,12 @@ ATOMIC_NUMBERS = {
 MAX_ATOMIC_NUMBER = max(ATOMIC_NUMBERS.values())
 
 PERIODIC_TABLE_INFO = {
-    'H': (1, 1), 'He': (1, 18), 'Li': (2, 1), 'Be': (2, 2), 'B': (2, 13), 'C': (2, 14),
-    'N': (2, 15), 'O': (2, 16), 'F': (2, 17), 'Ne': (2, 18), 'Na': (3, 1), 'Mg': (3, 2),
-    'Al': (3, 13), 'Si': (3, 14), 'P': (3, 15), 'S': (3, 16), 'Cl': (3, 17), 'Ar': (3, 18),
-    'K': (4, 1), 'Ca': (4, 2), 'Sc': (4, 3), 'Ti': (4, 4), 'V': (4, 5), 'Cr': (4, 6),
-    'Mn': (4, 7), 'Fe': (4, 8), 'Co': (4, 9), 'Ni': (4, 10), 'Cu': (4, 11), 'Zn': (4, 12),
-    'Ga': (4, 13), 'Ge': (4, 14), 'As': (4, 15), 'Se': (4, 16), 'Br': (4, 17), 'Kr': (4, 18)
-    # Add more if needed
+    'H': (0, 0), 'He': (0, 17), 'Li': (1, 0), 'Be': (1, 1), 'B': (1, 12), 'C': (1, 13),
+    'N': (1, 14), 'O': (1, 15), 'F': (1, 16), 'Ne': (1, 17), 'Na': (2, 0), 'Mg': (2, 1),
+    'Al': (2, 12), 'Si': (2, 13), 'P': (2, 14), 'S': (2, 15), 'Cl': (2, 16), 'Ar': (2, 17),
+    'K': (3, 0), 'Ca': (3, 1), 'Sc': (3, 2), 'Ti': (3, 3), 'V': (3, 4), 'Cr': (3, 5),
+    'Mn': (3, 6), 'Fe': (3, 7), 'Co': (3, 8), 'Ni': (3, 9), 'Cu': (3, 10), 'Zn': (3, 11),
+    'Ga': (3, 12), 'Ge': (3, 13), 'As': (3, 14), 'Se': (3, 15), 'Br': (3, 16), 'Kr': (3, 17)
 }
 
 # --- NEW UTILITY: Reverse Map (Atomic Number -> Symbol) ---
@@ -56,6 +55,11 @@ PERIODIC_TABLE_INFO = {
 ATOMIC_SYMBOLS = {v: k for k, v in ATOMIC_NUMBERS.items()}
 # Add symbol for unrecognized atoms (index 0)
 ATOMIC_SYMBOLS[0] = 'X' 
+STANDARD_BIOMOLECULE_RESNAMES = {
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "HSD", "HSE", "HSP",
+    "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+    "A", "C", "G", "U", "DA", "DC", "DG", "DT",
+}
 
 
 def _format_atom_label(atom, fallback_element: str, atom_index: int, is_xyz: bool) -> str:
@@ -65,6 +69,35 @@ def _format_atom_label(atom, fallback_element: str, atom_index: int, is_xyz: boo
     resname = str(getattr(atom, "resname", "") or "UNK").strip() or "UNK"
     resid = getattr(atom, "resid", atom_index + 1)
     return f"{atom_name}_{resname}_{resid}"
+
+
+def infer_element_symbol_from_atom_name(atom_name: str) -> str:
+    """Infer biomolecular element symbols from atom names like HE1, NE2, CA."""
+    letters = ''.join(ch for ch in str(atom_name).strip() if ch.isalpha()).upper()
+    if not letters:
+        return "X"
+    if letters.startswith(("CL", "NA", "MG", "ZN", "FE", "CA")) and letters[:2].capitalize() in ATOMIC_NUMBERS:
+        return letters[:2].capitalize()
+    if letters[0] in {"H", "C", "N", "O", "S", "P", "F", "K", "B"}:
+        return letters[0].capitalize()
+    if len(letters) >= 2 and letters[:2].capitalize() in ATOMIC_NUMBERS:
+        return letters[:2].capitalize()
+    return letters[0].capitalize()
+
+
+def infer_element_symbol_from_atom(atom) -> str:
+    atom_name = str(getattr(atom, "name", "") or "")
+    resname = str(getattr(atom, "resname", "") or "").strip().upper()
+    letters = ''.join(ch for ch in atom_name.strip() if ch.isalpha()).upper()
+    if resname in STANDARD_BIOMOLECULE_RESNAMES and letters[:1] in {"H", "C", "N", "O", "S", "P"}:
+        return letters[0].capitalize()
+    return infer_element_symbol_from_atom_name(atom_name)
+
+
+def _assign_periodic_attributes(symbol: str):
+    atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
+    row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
+    return atomic_num, row, col
 
 # --- NEW UTILITY: Load YAML Config ---
 def load_config_from_yaml(config_path: Path):
@@ -349,51 +382,38 @@ def _extract_mdanalysis_frame(filepath: Path, atoms, ts, frame_index: int, xyz_l
     atom_labels = np.empty(num_atoms, dtype="<U64")
     is_xyz = filepath.suffix.lower() == ".xyz"
 
-    # Try to get element symbols (best)
-    try:
+    if not is_xyz:
+        for i, atom in enumerate(atoms):
+            symbol = infer_element_symbol_from_atom(atom)
+            atomic_num, row, col = _assign_periodic_attributes(symbol)
+            atom_types[i] = atomic_num
+            atom_rows[i] = row
+            atom_cols[i] = col
+            atom_labels[i] = _format_atom_label(atom, symbol, i, is_xyz)
+    else:
+        # Try to get element symbols (best)
+        try:
         # Use elements attribute directly if available and reliable
-        elements = atoms.elements
+            elements = atoms.elements
 
-        for i, el in enumerate(elements):
-            symbol = str(el).capitalize() # Ensure compatibility with ATOMIC_NUMBERS keys
+            for i, el in enumerate(elements):
+                symbol = str(el).capitalize() # Ensure compatibility with ATOMIC_NUMBERS keys
 
-            # Store atomic number (e.g., C=6, O=8, Ca=20)
-            atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
-            atom_types[i] = atomic_num
+                atomic_num, row, col = _assign_periodic_attributes(symbol)
+                atom_types[i] = atomic_num
+                atom_rows[i] = row
+                atom_cols[i] = col
+                atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
 
-            # Look up row/col
-            row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
-            atom_rows[i] = row
-            atom_cols[i] = col
-            atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
-
-    except (NoDataError, AttributeError, ValueError):
-        # Fallback to atom names (less reliable)
-        print("Warning: 'elements' not found. Falling back to 'names' for atom types.")
-        atom_names = atoms.names
-        two_letter_symbols = [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 2]
-        one_letter_symbols = [s.upper() for s in ATOMIC_NUMBERS.keys() if len(s) == 1]
-        for i, name in enumerate(atom_names):
-            # Robust symbol extraction: try 2-letter elements first, then 1-letter, ignore digits
-            symbol_upper = ''.join(filter(str.isalpha, name)).upper()
-            symbol = 'X' # Default unknown
-
-            if len(symbol_upper) >= 2 and symbol_upper[:2] in two_letter_symbols:
-                # e.g., 'CLA' -> 'CL' -> 'Cl' (atomic number 17)
-                symbol = symbol_upper[:2].capitalize()
-            elif len(symbol_upper) >= 1 and symbol_upper[0] in one_letter_symbols:
-                # e.g., 'C1' -> 'C'
-                symbol = symbol_upper[0].capitalize()
-
-            # Store atomic number (e.g., C=6, O=8, Ca=20)
-            atomic_num = ATOMIC_NUMBERS.get(symbol, 0)
-            atom_types[i] = atomic_num
-
-            # Look up row/col
-            row, col = PERIODIC_TABLE_INFO.get(symbol, (0, 0))
-            atom_rows[i] = row
-            atom_cols[i] = col
-            atom_labels[i] = _format_atom_label(atoms[i], symbol, i, is_xyz)
+        except (NoDataError, AttributeError, ValueError):
+            print("Warning: 'elements' not found. Falling back to 'names' for atom types.")
+            for i, atom in enumerate(atoms):
+                symbol = infer_element_symbol_from_atom_name(getattr(atom, "name", ""))
+                atomic_num, row, col = _assign_periodic_attributes(symbol)
+                atom_types[i] = atomic_num
+                atom_rows[i] = row
+                atom_cols[i] = col
+                atom_labels[i] = _format_atom_label(atom, symbol, i, is_xyz)
 
     mol_dict['atom_types'] = atom_types
     mol_dict['atom_rows'] = atom_rows
@@ -613,10 +633,8 @@ def parse_extxyz_file(filepath: Path, cartesian_to_spherical_converter_func):
                          raw_atom_data[key][i] = species_symbol
                          
                          # Store atomic number (e.g., C=6, O=8, Ca=20)
-                         atomic_num = ATOMIC_NUMBERS.get(species_symbol, 0)
+                         atomic_num, row, col = _assign_periodic_attributes(species_symbol)
                          mol_dict['atom_types'][i] = atomic_num
-                         
-                         row, col = PERIODIC_TABLE_INFO.get(species_symbol, (0, 0))
                          mol_dict['atom_rows'][i] = row
                          mol_dict['atom_cols'][i] = col
                     elif info['dtype'] == bool:
@@ -901,20 +919,7 @@ def create_and_save_masked_npz(molecules, output_path: Path, statistics: dict, c
             else:
                  graph_level_keys.add(key)
 
-    # --- Load template NPZ file ---
-    # The template file should be placed where the application can access it.
-    # Here, we assume it's in the same directory as this script.
-    template_npz_path = Path(__file__).parent / "template.npz"
     save_dict = {}
-    if template_npz_path.exists():
-        print(f"Loading data from template file: {template_npz_path}")
-        with np.load(template_npz_path) as template_data:
-            for key in template_data.keys():
-                save_dict[key] = template_data[key]
-        print(f"Loaded keys from template: {list(save_dict.keys())}")
-    else:
-        print(f"Warning: Template file not found at {template_npz_path}. Proceeding without it.")
-    # --- End of template loading ---
 
     for key in sorted(list(atom_level_keys)):
         print(f"Processing atom-level property: {key}")
