@@ -508,6 +508,27 @@ def _slice_prepared_npz(source_npz: Path, output_dir: Path, frame_indices: Optio
     return sliced_npz
 
 
+def _progress_iter(iterable, total: int, description: str):
+    try:
+        from tqdm.auto import tqdm
+        return tqdm(iterable, total=total, desc=description, unit="batch")
+    except Exception:
+        class _SimpleProgress:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __iter__(self):
+                started = time.time()
+                for idx, item in enumerate(self._wrapped, 1):
+                    print(f"{description}: {idx}/{total} batch(es) elapsed={time.time() - started:.1f}s", flush=True)
+                    yield item
+
+            def close(self):
+                return None
+
+        return _SimpleProgress(iterable)
+
+
 def _process_prepare_job(job_id: str, prepared_id: str, prepared_dir: Path, input_path: Path, input_filename: str, trajectory_input_path: Optional[Path], trajectory_filename: Optional[str], custom_name: Optional[str], num_workers: int):
     try:
         def progress(value: float, message: str):
@@ -863,27 +884,34 @@ async def run_inference_workflow(
         # 3. Create the dataset from the generated NPZ
         frame_indices = None
         inference_npz_path = npz_output_path
-        sliced_npz_path = None
         try:
             with np.load(npz_output_path, allow_pickle=True) as npz_data:
                 num_frames = int(npz_data["pos"].shape[0]) if "pos" in npz_data.files and npz_data["pos"].ndim > 0 else 0
             frame_indices = _parse_frame_slice(frame_slice, num_frames)
-            if frame_indices is not None:
-                sliced_npz_path = _slice_prepared_npz(npz_output_path, Path(config["root"]), frame_indices, num_frames)
-                inference_npz_path = sliced_npz_path
             # Temporarily update the dataset_input in the config to point to the new NPZ file
             config['test_dataset_list'][0]['dataset_input'] = str(inference_npz_path)
+            if frame_indices is not None:
+                config['test_dataset_list'][0]['include_frames'] = frame_indices
+                print(
+                    f"Using frame slice {frame_slice}: {len(frame_indices)} of {num_frames} frame(s).",
+                    flush=True,
+                )
+            elif 'include_frames' in config['test_dataset_list'][0]:
+                config['test_dataset_list'][0].pop('include_frames')
 
+            dataset_started = time.time()
             dataset_config = _make_inference_dataset_config(config)
             builder = DatasetBuilder(dataset_config, np.random.default_rng(config.get('dataset_seed', 42)))
             inference_dset = builder.build_test()
             dataloader = DataLoader(inference_dset, batch_size=config['batch_size'], shuffle=False)
-            print(f"DatasetBuilder created DataLoader with {len(inference_dset)} structures.")
+            print(
+                f"DatasetBuilder created DataLoader with {len(inference_dset)} structures "
+                f"in {time.time() - dataset_started:.1f}s.",
+                flush=True,
+            )
         except Exception as e:
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
-            if sliced_npz_path is not None:
-                sliced_npz_path.unlink(missing_ok=True)
             raise HTTPException(status_code=500, detail=f"Failed to build inference dataset: {e}")
 
         # 4. Run Inference
@@ -924,7 +952,11 @@ async def run_inference_workflow(
 
         try:
             with torch.no_grad():
-                for data in dataloader:
+                total_batches = len(dataloader)
+                print(f"Starting model inference on {total_batches} batch(es) using {device}.", flush=True)
+                inference_started = time.time()
+                progress = _progress_iter(dataloader, total_batches, "Inference")
+                for data in progress:
                     data = data.to(device)
                     # Run inference without loss/metrics logic
                     out, _, _, _ = geq_run_inference(
@@ -961,11 +993,16 @@ async def run_inference_workflow(
                     else:
                         # If not de-standardizing, append the raw standardized output
                         all_predictions.append(predicted_cs_iso_std.cpu().numpy())
+                if hasattr(progress, "close"):
+                    progress.close()
+                print(f"Model inference finished in {time.time() - inference_started:.1f}s.", flush=True)
                     
             # Concatenate all batches
+            print("Concatenating predictions.", flush=True)
             final_predictions = np.concatenate(all_predictions, axis=0)
             
             # 5. Save Predictions to Output File(s)
+            print("Writing inference output files.", flush=True)
             file_extension = input_path.suffix.lower()
             if file_extension in [".pdb", ".gro"]:
                 output_paths, is_trajectory = processing.save_predictions_to_pdb(
@@ -1021,8 +1058,6 @@ async def run_inference_workflow(
             # 6. Cleanup temporary NPZ file
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
-            if sliced_npz_path is not None:
-                sliced_npz_path.unlink(missing_ok=True)
             
             print("--- Inference Workflow Complete ---")
             return final_output_path, final_predictions.shape[0]
@@ -1032,8 +1067,6 @@ async def run_inference_workflow(
             traceback.print_exc()
             if cleanup_npz:
                 npz_output_path.unlink(missing_ok=True)
-            if sliced_npz_path is not None:
-                sliced_npz_path.unlink(missing_ok=True)
             raise HTTPException(status_code=500, detail=f"Error during model inference or file saving: {e}")
 
     if prepared_npz_path:

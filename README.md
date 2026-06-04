@@ -2,6 +2,30 @@
 
 GEqNMR prepares molecular structures/trajectories, runs GEqTrain deployed models for chemical-shift inference, and stores prepared inputs/results under a shared data root.
 
+## Local Console Environment With CUDA
+
+The shell console uses the local Python environment, not Docker. CUDA inference requires a CUDA-enabled PyTorch build in `.venv-geqnmr`.
+
+Create or rebuild the environment with:
+
+```bash
+cd /home/angiod@usi.ch/GEqNMR
+./venv_setup.sh --recreate
+```
+
+The setup script asks which PyTorch backend to install. On the current CUDA
+machines, `cu126` is a good default. For non-interactive setup, pass the backend
+explicitly:
+
+```bash
+./venv_setup.sh --recreate --torch-backend cu126
+```
+
+The script runs a PyTorch/CUDA check at the end and prints the installed Torch
+version, CUDA runtime, CUDA availability, GPU count, and GPU names.
+
+If `torch.version.cuda` is `None`, the environment has CPU-only PyTorch and `cuda`, `cuda:0`, etc. will not work.
+
 ## Deploying GEqTrain Models for GEqNMR
 
 GEqNMR expects TorchScript GEqTrain deployment files (`.pth`) in the models directory configured by `GEQNMR_MODELS_DIR` or, by default:

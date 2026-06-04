@@ -6,7 +6,4 @@ debugpy
 python-multipart
 numpy
 MDAnalysis
---find-links https://download.pytorch.org/whl/torch_stable.html
-# torch==2.3.0+cu118
-torch==2.3.0+cpu
 geqtrain @ git+https://github.com/limresgrp/GEqTrain@ace656381046633aa581d33f9f863bcdadc2945e
