@@ -24,6 +24,7 @@ from geqtrain.data.dataloader import DataLoader
 from geqtrain.train.components.dataset_builder import DatasetBuilder
 from geqtrain.data import AtomicDataDict # Assuming this holds keys like 'pos', 'node_types' etc.
 from geqtrain.train.components.inference import run_inference as geq_run_inference
+from geqtrain.train.utils import evaluate_end_chunking_condition
 from geqtrain.utils.deploy import load_deployed_model
 from geqtrain.utils.inference_metadata import INFERENCE_METADATA_KEY, load_inference_metadata_bundle
 from geqtrain.utils._global_options import apply_global_config
@@ -336,6 +337,43 @@ def _make_inference_dataset_config(config: Config) -> Config:
         if key in dataset_config:
             dataset_config.pop(key)
     return dataset_config
+
+
+def _metadata_float(metadata: dict, key: str) -> Optional[float]:
+    raw_value = metadata.get(key)
+    if raw_value is None or raw_value == "":
+        return None
+    try:
+        return float(raw_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_model_cutoff_to_inference_config(config: Config, metadata: dict) -> Optional[float]:
+    r_max = _metadata_float(metadata, "r_max")
+    if r_max is None:
+        try:
+            r_max = float(config.get("r_max"))
+        except (TypeError, ValueError):
+            r_max = None
+    if r_max is None:
+        return None
+
+    config["r_max"] = r_max
+    for dataset_spec in config.get("test_dataset_list", []):
+        if not isinstance(dataset_spec, dict):
+            continue
+        extra_fixed_fields = dict(dataset_spec.get("extra_fixed_fields") or {})
+        extra_fixed_fields["r_max"] = r_max
+        dataset_spec["extra_fixed_fields"] = extra_fixed_fields
+    return r_max
+
+
+def _configure_inference_chunking(config: Config):
+    if "chunking" not in config:
+        config["chunking"] = True
+    if "batch_max_atoms" not in config:
+        config["batch_max_atoms"] = int(os.environ.get("GEQNMR_INFERENCE_BATCH_MAX_ATOMS", "1000"))
 
 
 @app.get("/")
@@ -873,8 +911,19 @@ async def run_inference_workflow(
         test_config = Config.from_file(TEMPLATE_CONFIG)
         config.update(test_config)
         _disable_dataset_target_requirements(config)
+        model_r_max = _apply_model_cutoff_to_inference_config(config, metadata)
+        if model_r_max is None:
+            print("WARNING: Deployed model did not expose r_max; GEqTrain dataset config will choose the cutoff.")
+        else:
+            print(f"Using deployed model cutoff r_max={model_r_max} for inference dataset construction.")
         # Set batch size for inference
         config['batch_size'] = batch_size
+        _configure_inference_chunking(config)
+        if config.get("chunking"):
+            print(
+                f"Inference chunking enabled with batch_max_atoms={config.get('batch_max_atoms')}.",
+                flush=True,
+            )
         config["denormalize_inference_outputs"] = bool(destandardize and has_inference_normalization_stats)
         apply_global_config(config.as_dict(), warn_on_override=False)
         print("Configuration loaded and merged.")
@@ -950,49 +999,92 @@ async def run_inference_workflow(
         all_predictions = []
         model.eval()
 
+        def _extract_predicted_cs_iso(out: dict) -> torch.Tensor:
+            if 'cs_tensor_spherical' in out:
+                return out['cs_tensor_spherical'][:, 0:1].flatten()
+            if 'cs_iso' in out:
+                return out['cs_iso'].flatten()
+            raise KeyError("Model output is missing 'cs_tensor_spherical' or 'cs_iso'. Cannot extract isotropic shift.")
+
+        def _destandardize_if_needed(predicted_cs_iso_std: torch.Tensor, atom_types: torch.Tensor) -> torch.Tensor:
+            if not (destandardize and not has_inference_normalization_stats):
+                return predicted_cs_iso_std
+            means = mean_per_type[atom_types.flatten()].flatten()
+            stds = std_per_type[atom_types.flatten()].flatten()
+            return (predicted_cs_iso_std * stds) + means
+
+        def _run_model_step(data, already_computed_nodes=None):
+            out, ref_data, center_nodes, num_center_nodes = geq_run_inference(
+                model=model,
+                data=data,
+                device=device,
+                loss_fn=None,
+                config=config.as_dict(),
+                is_train=False,
+                already_computed_nodes=already_computed_nodes,
+                inference_metadata=inference_metadata,
+            )
+            predicted = _extract_predicted_cs_iso(out)
+            atom_types = ref_data[AtomicDataDict.NODE_TYPE_KEY].flatten()
+            predicted = _destandardize_if_needed(predicted, atom_types)
+            return predicted, ref_data, center_nodes, num_center_nodes
+
+        def _run_full_batch(data):
+            predicted, _ref_data, _center_nodes, _num_center_nodes = _run_model_step(data)
+            return predicted.detach().cpu().numpy()
+
+        def _run_chunked_batch(data):
+            data.original_node_index = torch.arange(data.num_nodes, dtype=torch.long)
+            ordered_predictions = torch.empty(data.num_nodes, dtype=torch.float32)
+            already_computed_nodes = None
+            num_batch_center_nodes = int(data[AtomicDataDict.EDGE_INDEX_KEY][0].unique().numel())
+
+            while True:
+                predicted, ref_data, center_nodes, _num_center_nodes = _run_model_step(
+                    data,
+                    already_computed_nodes=already_computed_nodes,
+                )
+                original_node_index = ref_data["original_node_index"].to(center_nodes.device)
+                center_mask = torch.isin(original_node_index, center_nodes)
+                target_indices = original_node_index[center_mask].detach().cpu()
+                ordered_predictions[target_indices] = predicted[center_mask].detach().cpu().to(torch.float32)
+
+                already_computed_nodes = evaluate_end_chunking_condition(
+                    already_computed_nodes,
+                    center_nodes,
+                    num_batch_center_nodes,
+                )
+                del predicted, ref_data, center_nodes, original_node_index, center_mask, target_indices
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                if already_computed_nodes is None:
+                    break
+
+            return ordered_predictions.numpy()
+
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 total_batches = len(dataloader)
                 print(f"Starting model inference on {total_batches} batch(es) using {device}.", flush=True)
                 inference_started = time.time()
                 progress = _progress_iter(dataloader, total_batches, "Inference")
-                for data in progress:
-                    data = data.to(device)
-                    # Run inference without loss/metrics logic
-                    out, _, _, _ = geq_run_inference(
-                        model=model, data=data, device=device,
-                        loss_fn=None, config=config.as_dict(), is_train=False,
-                        inference_metadata=inference_metadata,
+                for batch_index, data in enumerate(progress, start=1):
+                    num_nodes = int(getattr(data, "num_nodes", 0) or data[AtomicDataDict.POSITIONS_KEY].shape[0])
+                    num_edges = int(data[AtomicDataDict.EDGE_INDEX_KEY].shape[1])
+                    print(
+                        f"Inference batch {batch_index}/{total_batches}: "
+                        f"nodes={num_nodes}, edges={num_edges}, chunking={bool(config.get('chunking'))}.",
+                        flush=True,
                     )
-                    
-                    # Extract predicted isotropic component ('cs_iso')
-                    if 'cs_tensor_spherical' in out:
-                        # Isotropic component is the first (l=0) component
-                        predicted_cs_iso_std = out['cs_tensor_spherical'][:, 0:1].flatten()
-                    elif 'cs_iso' in out:
-                         # If the model directly outputs cs_iso
-                        predicted_cs_iso_std = out['cs_iso'].flatten()
+                    if config.get("chunking"):
+                        all_predictions.append(_run_chunked_batch(data))
                     else:
-                        raise KeyError("Model output is missing 'cs_tensor_spherical' or 'cs_iso'. Cannot extract isotropic shift.")
-                    
-                    # --- Conditionally De-standardize the predictions ---
-                    if destandardize and not has_inference_normalization_stats:
-                        # 1. Get atom types for the current batch
-                        atom_types = data[AtomicDataDict.NODE_TYPE_KEY].flatten()
-                        
-                        # 2. Gather the corresponding mean and std for each atom
-                        # mean_per_type has shape [num_atom_types, 1], atom_types has shape [num_atoms_in_batch]
-                        # This gathers the correct mean/std for each atom based on its type.
-                        means = mean_per_type[atom_types].flatten()
-                        stds = std_per_type[atom_types].flatten()
-                        
-                        # 3. Apply de-standardization: original = (standardized * std) + mean
-                        predicted_cs_iso_destd = (predicted_cs_iso_std * stds) + means
-                        
-                        all_predictions.append(predicted_cs_iso_destd.cpu().numpy())
-                    else:
-                        # If not de-standardizing, append the raw standardized output
-                        all_predictions.append(predicted_cs_iso_std.cpu().numpy())
+                        all_predictions.append(_run_full_batch(data))
+                    if device.type == "cuda":
+                        allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                        reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
+                        print(f"CUDA memory after batch: allocated={allocated:.2f} GiB reserved={reserved:.2f} GiB", flush=True)
+                        torch.cuda.empty_cache()
                 if hasattr(progress, "close"):
                     progress.close()
                 print(f"Model inference finished in {time.time() - inference_started:.1f}s.", flush=True)

@@ -176,6 +176,8 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
     # FIX: Explicitly reshape predictions_np to a 1D vector before slicing/clipping.
     b_factors = predictions_np.reshape(-1).astype(np.float32)
     b_factors_clipped = np.clip(b_factors, -999.99, 999.99)
+    if not hasattr(universe.atoms, "tempfactors"):
+        universe.add_TopologyAttr("tempfactors")
     
     is_trajectory = len(selected_frame_indices) > 1
     output_paths = []
