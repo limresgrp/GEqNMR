@@ -37,10 +37,20 @@ TEMPLATE_CONFIG = Path(__file__).parent / "template.yaml"
 # --- existing app definition ---
 app = FastAPI()
 
+FRONTEND_PORT = os.environ.get("GEQNMR_FRONTEND_PORT", "5273")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "GEQNMR_CORS_ORIGINS",
+        f"http://localhost:{FRONTEND_PORT},http://127.0.0.1:{FRONTEND_PORT}",
+    ).split(",")
+    if origin.strip()
+]
+
 # --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1102,6 +1112,7 @@ async def run_inference_workflow(
                     predictions_np=final_predictions,
                     output_dir=output_dir,
                     frame_indices=frame_indices,
+                    trajectory_path=trajectory_path,
                 )
 
                 # If it's a PDB trajectory, zip the individual frame files

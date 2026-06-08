@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 
 // Base URL for the FastAPI backend
-const API_URL = 'http://localhost:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8273';
 
 function App() {
   const [backendStatus, setBackendStatus] = useState('Checking connection...');

@@ -6,6 +6,31 @@ DEFAULT_DATA_ROOT="${ROOT_DIR}/outputs"
 ENV_FILE="${ROOT_DIR}/.env"
 DEFAULT_PYTHON="${ROOT_DIR}/.venv-geqnmr/bin/python"
 
+load_env_file() {
+  if [ ! -f "$ENV_FILE" ]; then
+    return
+  fi
+  while IFS='=' read -r raw_key raw_value; do
+    local key value
+    key="$(printf '%s' "$raw_key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ -z "$key" ] || [[ "$key" == \#* ]]; then
+      continue
+    fi
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      continue
+    fi
+    value="$(printf '%s' "${raw_value:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [ "${#value}" -ge 2 ]; then
+      if { [ "${value:0:1}" = "'" ] && [ "${value: -1}" = "'" ]; } || { [ "${value:0:1}" = '"' ] && [ "${value: -1}" = '"' ]; }; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
+    if [ -z "${!key+x}" ]; then
+      export "$key=$value"
+    fi
+  done < "$ENV_FILE"
+}
+
 read_env_value() {
   local key="$1"
   if [ ! -f "$ENV_FILE" ]; then
@@ -32,6 +57,8 @@ for raw in path.read_text().splitlines():
 sys.exit(1)
 PY
 }
+
+load_env_file
 
 SAVED_DATA_ROOT="$(read_env_value GEQNMR_DATA_ROOT || true)"
 DATA_ROOT="${GEQNMR_DATA_ROOT:-${SAVED_DATA_ROOT:-${DEFAULT_DATA_ROOT}}}"

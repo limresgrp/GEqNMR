@@ -150,7 +150,7 @@ Install these three tools **on your local (Windows/macOS/Linux) machine**:
 
 5. **Access the app**
 
-   * Frontend (React): [http://localhost:5173](http://localhost:5173)
+   * Frontend (React): [http://localhost:5273](http://localhost:5273)
    * Backend (FastAPI): [http://localhost:8000](http://localhost:8000)
    * API Docs: [http://localhost:8000/docs](http://localhost:8000/docs)
 
@@ -402,7 +402,7 @@ docker compose up -d --build
 
 Now open:
 
-* Frontend → `http://<server_ip>:5173`
+* Frontend → `http://<server_ip>:5273`
 * Backend → `http://<server_ip>:8000`
 
 ---
@@ -413,12 +413,12 @@ Now you will use the SSH Tunnel, as described in the tutorial, to connect your l
 
 - On your LOCAL machine (in a new terminal):
 
-Run the following ssh command. This command forwards your local ports 5173 and 8000 through an encrypted tunnel to the server's localhost:5173 and localhost:8000.
+Run the following ssh command. This command forwards your local ports 5273 and 8000 through an encrypted tunnel to the server's localhost:5273 and localhost:8000.
 
 Replace username@your_server_ip with your server's credentials.
 
 ```bash
-ssh -L 5173:localhost:5173 -L 8000:localhost:8000 username@your_server_ip
+ssh -L 5273:localhost:5273 -L 8000:localhost:8000 username@your_server_ip
 ```
 
 - Leave this terminal running. It is maintaining your secure tunnel.
@@ -430,7 +430,7 @@ ssh -L 5173:localhost:5173 -L 8000:localhost:8000 username@your_server_ip
 #### RHEL 9
 
 ```bash
-sudo firewall-cmd --permanent --add-port=5173/tcp
+sudo firewall-cmd --permanent --add-port=5273/tcp
 sudo firewall-cmd --permanent --add-port=8000/tcp
 sudo firewall-cmd --reload
 ```
@@ -439,7 +439,7 @@ sudo firewall-cmd --reload
 
 ```bash
 sudo ufw allow ssh
-sudo ufw allow 5173/tcp
+sudo ufw allow 5273/tcp
 sudo ufw allow 8000/tcp
 sudo ufw enable
 ```

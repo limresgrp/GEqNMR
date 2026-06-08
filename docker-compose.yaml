@@ -8,12 +8,12 @@ services:
     # 2. If successful (&&), then start the Uvicorn server.
     # The app path is now relative to the new working_dir.
     command: >
-      sh -c "uvicorn backend.app.main:app --reload --workers 1 --host 0.0.0.0 --port 8000"
+      sh -c "uvicorn backend.app.main:app --reload --workers 1 --host 0.0.0.0 --port ${GEQNMR_BACKEND_PORT:-8273}"
     volumes:
       - .:/workspaces/GEqNMR
       - ${GEQNMR_DATA_ROOT:-./outputs}:${GEQNMR_DATA_ROOT:-/workspaces/GEqNMR/outputs}
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${GEQNMR_BACKEND_PORT:-8273}:${GEQNMR_BACKEND_PORT:-8273}"
     # Set the working directory to the project root.
     # This makes Python imports consistent.
     working_dir: /workspaces/GEqNMR
@@ -22,6 +22,7 @@ services:
     environment:
       GEQNMR_DATA_ROOT: ${GEQNMR_DATA_ROOT:-/workspaces/GEqNMR/outputs}
       GEQNMR_MODELS_DIR: ${GEQNMR_MODELS_DIR:-/workspaces/GEqNMR/models}
+      GEQNMR_FRONTEND_PORT: ${GEQNMR_FRONTEND_PORT:-5273}
     tty: true
 
   frontend:
@@ -32,12 +33,14 @@ services:
     # 2. If successful (&&), then start the Vite dev server.
     command: >
       sh -c "npm install &&
-             npm run dev -- --host 0.0.0.0"
+             npm run dev -- --host 0.0.0.0 --port ${GEQNMR_FRONTEND_PORT:-5273}"
     volumes:
       - ./frontend:/app
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:${GEQNMR_FRONTEND_PORT:-5273}:${GEQNMR_FRONTEND_PORT:-5273}"
     working_dir: /app
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:${GEQNMR_BACKEND_PORT:-8273}}
     tty: true
 
   redis:

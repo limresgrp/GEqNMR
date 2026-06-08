@@ -7,7 +7,7 @@
   // The folder inside the container where our project will be mounted.
   "workspaceFolder": "/workspaces/GEqNMR",
   // Forward necessary ports from the container to the local machine.
-  "forwardPorts": [8000, 5173, 6379],
+  "forwardPorts": [8000, 5273, 6379],
   // VS Code settings to apply inside the container.
   "settings": {
     "python.pythonPath": "/usr/local/bin/python",

@@ -147,7 +147,13 @@ def _clear_pdb_occupancy(pdb_path: Path):
     pdb_path.write_text("".join(updated_lines))
 
 
-def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output_dir: Path, frame_indices: Optional[List[int]] = None):
+def save_predictions_to_pdb(
+    input_path: Path,
+    predictions_np: np.ndarray,
+    output_dir: Path,
+    frame_indices: Optional[List[int]] = None,
+    trajectory_path: Optional[Path] = None,
+):
     """
     Loads a structure, updates the B-factor column with predictions, and saves new PDB file(s).
     If the input is a trajectory (multi-frame), it saves one PDB per frame.
@@ -155,13 +161,22 @@ def save_predictions_to_pdb(input_path: Path, predictions_np: np.ndarray, output
     """
     print(f"--- Writing predictions from {input_path.name} to PDB format ---")
     
-    universe = mda.Universe(str(input_path))
+    if trajectory_path is not None:
+        print(f"Using trajectory for output frames: {trajectory_path.name}")
+        universe = mda.Universe(str(input_path), str(trajectory_path))
+    else:
+        universe = mda.Universe(str(input_path))
     atoms = universe.atoms
     
     # Calculate the total number of atoms in the entire trajectory
     n_atoms_per_frame = len(atoms)
     total_frames = len(universe.trajectory)
     selected_frame_indices = frame_indices if frame_indices is not None else list(range(total_frames))
+    if selected_frame_indices and max(selected_frame_indices) >= total_frames:
+        raise ValueError(
+            f"Selected frame index {max(selected_frame_indices)} exceeds available trajectory frames "
+            f"({total_frames}). Provide the same trajectory used for prepared input when writing output."
+        )
     total_atoms_predicted = n_atoms_per_frame * total_frames
     expected_atoms_predicted = n_atoms_per_frame * len(selected_frame_indices)
     
